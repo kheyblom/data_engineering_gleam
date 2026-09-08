@@ -1,0 +1,19 @@
+directories:
+  download: /glade/derecho/scratch/kheyblom/data/gleam/
+  logs: ./logs
+output_conventions:
+  filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
+  suffix: spatial
+log_file: gleam_zarr.log
+version: v4.3a
+variables: all
+temporal_resolution: daily
+grid_name: native_0p1x0p1
+chunks:
+  time: 5
+  lat: -1
+  lon: -1
+timesteps_per_commit: 100
+
+num_workers: 8
+file_cache_maxsize: 32

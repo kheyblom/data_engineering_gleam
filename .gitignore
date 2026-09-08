@@ -92,3 +92,7 @@ credentials
 *~
 .DS_Store
 Thumbs.db
+
+
+# ---- EDrafting ----
+draft*
