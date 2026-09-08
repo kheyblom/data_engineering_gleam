@@ -1,0 +1,94 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+.eggs/
+*.egg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.conda/
+conda-meta/
+
+# Testing / coverage / linting
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.hypothesis/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+profile_default/
+ipython_config.py
+.jupyter/
+*.nbconvert.ipynb
+
+# ---- Data / outputs ----
+data/
+*.nc
+*.nc4
+*.h5
+*.hdf5
+*.zarr/
+*.grib
+*.grb2
+*.parquet
+*.feather
+*.csv.gz
+*.npy
+*.npz
+*.pkl
+*.pickle
+output/
+outputs/
+results/
+figures/
+*.png
+*.pdf
+!docs/**/*.png
+
+# ---- Logs / job scheduler ----
+*.log
+logs/
+*.out
+*.err
+slurm-*.out
+*.o[0-9]*
+*.e[0-9]*
+core.[0-9]*
+
+# ---- Secrets / config ----
+.env
+.env.*
+*.pem
+*.key
+credentials
+.netrc
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
