@@ -120,77 +120,21 @@ is [config/config_zarr.yaml](config/config_zarr.yaml).
 
 ### The three settings that decide what a run costs
 
-These last three keys are the ones worth understanding before launching a long
-job. `timesteps_per_commit` sets how much work is at risk when a job dies;
-`num_workers` and `file_cache_maxsize` set how much memory the run needs to stay
-inside. Neither of the latter two changes the store that gets written — only the
-resources used to write it.
+These are the keys worth setting deliberately before a long job.
+`timesteps_per_commit` decides how much work a crash throws away; the other two
+decide how much memory the run needs. Neither of the latter changes the store
+that gets written, only the resources used to write it.
 
-#### `timesteps_per_commit` (default 100)
+| Key | Default | What it controls |
+| --- | --- | --- |
+| `timesteps_per_commit` | 100 | Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
+| `num_workers` | dask's own, sized from the cpuset | Size of the dask thread pool, and so how many chunks are in flight — the dominant memory term, roughly `num_workers` x one chunk, about 1 GiB at 8 workers and 124 MiB chunks. It buys parallelism in exact proportion to the memory it costs. It **must not exceed the job's `ncpus`**: if you need more workers, raise `ncpus` in [submit_gleam_zarr.sh](submit_gleam_zarr.sh) rather than lowering the config, which the script checks and refuses to launch on. |
+| `file_cache_maxsize` | xarray's, 128 files | How many netCDF files stay open, each holding its own 64 MiB HDF5 chunk cache — the second memory term, and easy to overlook because the files are cheap but their caches are not. It only has to cover the files one batch touches, at most two year files per variable, so `32` is generous here and well below the several idle GiB the default would hold. |
 
-How many timesteps are written and committed to icechunk as one unit.
-
-The dataset is assembled lazily and then pushed out batch by batch, with a
-commit after each. That commit is the resume point: an interrupted run restarts
-at the last committed batch, so this key is the trade-off between how much work
-a crash costs you and how much commit overhead you pay. Smaller batches redo
-less after a failure; larger batches spend proportionally less time committing.
-
-Two things about it are easy to get wrong:
-
-- **It is rounded, not used verbatim.** `commit_batch_size` rounds the value to
-  the nearest whole multiple of the `time` chunk (never below one chunk). With
-  `time: 5` and `timesteps_per_commit: 100`, the batch is exactly 100; with
-  `time: 7` it would become 98. This is mandatory: xarray cannot append onto a
-  partially filled chunk from dask, so every batch boundary must fall on a chunk
-  boundary and only the *final* batch may be short. The `time` coordinate is
-  additionally encoded with one chunk per batch for the same reason.
-- **It is not a memory setting.** The `batch.nbytes` figure in the log — about
-  34 GiB at the current settings — is the logical size of the batch, not what is
-  resident. Each batch is streamed to the store chunk by chunk. Raising this
-  value does not raise peak memory; the two keys below are what do.
-
-Changing it between runs breaks resume. A store whose length is not a whole
-number of the current batch size is rejected on resume, and the fix is to delete
-and rebuild rather than patch around it.
-
-#### `num_workers` (optional)
-
-Size of the dask thread pool, and therefore how many chunks are in flight at
-once.
-
-This is the dominant term in peak memory: roughly `num_workers` x one chunk. At
-`num_workers: 8` with 124 MiB chunks that is about 1 GiB of chunk buffers, on
-top of the file caches below and the usual interpreter and library overhead.
-Raising it buys parallelism in exact proportion to the memory it costs.
-
-It **must not exceed the `ncpus` the batch job requested.** The config is
-authoritative here — if you need more workers, raise `ncpus` in
-[submit_gleam_zarr.sh](submit_gleam_zarr.sh) to match, rather than lowering the
-config to fit the job. The submit script enforces this and refuses to launch on
-a mismatch.
-
-Leave it unset and dask sizes its own pool from the cpuset the job was given,
-which is a reasonable default. It is applied by `configure_runtime` before
-anything opens a file, since it does not take effect retroactively, and the
-resolved value is logged — so a job killed for running out of memory can be read
-back against the settings it actually ran with.
-
-#### `file_cache_maxsize` (optional)
-
-How many netCDF files xarray keeps open at once.
-
-Every open netCDF file carries an HDF5 chunk cache of its own, 64 MiB by
-default, so this is the second memory term and an easy one to overlook: the
-files themselves are cheap, their caches are not. xarray's own default is 128
-files, which here would reserve several gigabytes for caches that are mostly
-idle.
-
-The cache only has to cover the files a single batch actually touches. A batch
-spans at most two year files per variable, so `32` is generous for the current
-variable set and still an order of magnitude below what the default would hold.
-Like `num_workers` it is applied by `configure_runtime` up front, falls back to
-the library default when unset, and is logged as resolved.
+Both memory settings are applied by `configure_runtime` before anything opens a
+file, since neither takes effect retroactively, and the resolved values are
+logged — so a job killed for running out of memory can be read back against the
+settings it actually ran with.
 
 ## How the build works
 
