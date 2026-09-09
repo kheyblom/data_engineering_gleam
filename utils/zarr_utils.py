@@ -18,6 +18,7 @@ import logging
 
 import dask
 from dask.system import CPU_COUNT
+import netCDF4
 import numpy as np
 import xarray as xr
 import icechunk
@@ -30,19 +31,30 @@ LOG = logging.getLogger(__name__)
 # commit overhead stays negligible
 DEFAULT_TIMESTEPS_PER_COMMIT = 100
 
+# chunk cache slots. The raw files are chunked [12, 57, 113], so one 12 timestep
+# deep row covering a whole lat/lon plane is 32 x 32 = 1024 chunks; HDF5 hashes
+# chunks into these slots, so it wants comfortably more than that, and a prime
+# spreads them evenly.
+DEFAULT_CHUNK_CACHE_SLOTS = 2003
+
 # branch every commit is written to
 BRANCH = 'main'
 
 
 def configure_runtime(settings):
-    """Apply the optional execution settings that bound peak memory.
+    """Apply the optional execution settings that bound cost and peak memory.
 
-    Neither setting changes the store that is written, only the memory needed to
-    write it. Dask's worker count sets how many chunks are held in flight at
-    once, and xarray's open file cache sets how many netCDF files stay open,
-    each holding an HDF5 chunk cache of its own. Both are left to the library
-    default when the config does not set them, so an unset ``num_workers``
-    still follows the cpuset the batch job was given.
+    None of these change the store that is written, only what it costs to write
+    it. Dask's worker count sets how many chunks are held in flight at once;
+    xarray's open file cache sets how many netCDF files stay open; and the HDF5
+    chunk cache sets how much decompressed data each of those files keeps, which
+    is what stops a 12 timestep deep source chunk being decompressed once per
+    timestep. All are left to the library default when the config does not set
+    them, so an unset ``num_workers`` still follows the cpuset the batch job was
+    given.
+
+    The last two multiply: the chunk cache is per open file, so the memory this
+    can reach is roughly ``file_cache_maxsize`` x ``chunk_cache_size_mib``.
 
     Args:
         settings (dict): The loaded configuration.
@@ -55,12 +67,26 @@ def configure_runtime(settings):
     if file_cache_maxsize:
         xr.set_options(file_cache_maxsize=file_cache_maxsize)
 
+    # The raw files are chunked 12 timesteps deep but the store is written one
+    # timestep at a time, so without a cache big enough to hold a whole 12 deep
+    # row of chunks (302 MiB) HDF5 decompresses each one twelve times over.
+    # Measured at 7.6x end to end, which dwarfs every other setting here.
+    chunk_cache_size_mib = settings.get('chunk_cache_size_mib')
+    if chunk_cache_size_mib:
+        netCDF4.set_chunk_cache(
+            size=chunk_cache_size_mib * 1024**2,
+            nelems=settings.get('chunk_cache_slots', DEFAULT_CHUNK_CACHE_SLOTS),
+            # keep fully read chunks in preference to partially read ones
+            preemption=0.75,
+        )
+
     # log what was resolved rather than what was asked for, so a run killed for
     # running out of memory can be read back against the settings it really used
     LOG.info(
         f'dask workers: {num_workers or CPU_COUNT}'
         f'{"" if num_workers else " (detected)"}, '
-        f'open file cache: {xr.get_options()["file_cache_maxsize"]} files'
+        f'open file cache: {xr.get_options()["file_cache_maxsize"]} files, '
+        f'hdf5 chunk cache: {chunk_cache_size_mib or "default"} MiB per file'
     )
 
 

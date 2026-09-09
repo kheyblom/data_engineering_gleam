@@ -1,10 +1,17 @@
+# Tier 3a config: the real raw tree, but a throwaway store. timesteps_per_commit
+# is baked into the time coordinate's chunking when the store is created and
+# cannot be changed on a resume, so it has to be measured somewhere disposable
+# before the real store is started.
+#
+# The only difference from config_zarr.yaml is the suffix, which lands this
+# store beside the real one under a different name. Delete it after Tier 3a.
 directories:
   download: /glade/derecho/scratch/kheyblom/data/gleam/
   logs: ./logs
 output_conventions:
   filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
-  suffix: spatial
-log_file: gleam_zarr.log
+  suffix: bench
+log_file: gleam_zarr_bench.log
 version: v4.3a
 variables: all
 temporal_resolution: daily
@@ -14,7 +21,7 @@ chunks:
   lat: -1
   lon: -1
 timesteps_per_commit: 100
-num_workers: 4
+num_workers: 8
 file_cache_maxsize: 32
 # the raw files are chunked 12 timesteps deep while the store is written one
 # timestep at a time, so this has to hold a whole 12 deep row of chunks (302 MiB)

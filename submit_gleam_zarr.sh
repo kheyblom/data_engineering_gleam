@@ -1,22 +1,6 @@
 #!/bin/bash -l
-#
-# Submit the GLEAM zarr build as a Casper batch job.
-#
-#   ./submit_gleam_zarr.sh                          # default config
-#   CONFIG=config/other.yaml ./submit_gleam_zarr.sh
-#
-# The account is taken from $PBS_ACCOUNT, the same variable qcmd and
-# qinteractive read, so it can live in ~/.bashrc rather than in this file.
-# Passing it explicitly still works: qsub -A <PROJECT> submit_gleam_zarr.sh
-#
-# The build is restartable: a run killed by walltime leaves a store committed up
-# to its last batch, and resubmitting this script with the same config picks up
-# from there. Resubmitting after a completed run is a no-op.
-#
+
 #PBS -N gleam_zarr
-#PBS -q casper
-#PBS -l select=1:ncpus=8:mem=32GB
-#PBS -l walltime=12:00:00
 #PBS -j oe
 #PBS -o logs/
 
@@ -31,7 +15,44 @@ if [[ -z ${PBS_ENVIRONMENT:-} ]]; then
         echo "       export it in ~/.bashrc, or submit with qsub -A <PROJECT>" >&2
         exit 1
     fi
-    qsub_args=(-A "${PBS_ACCOUNT}")
+    # the queue shape is not a #PBS directive either, since testing needs to
+    # vary it and a directive cannot expand a variable: these defaults are the
+    # production run, and a develop queue test overrides them in the
+    # environment. They are set only here, so that inside the job NCPUS stays
+    # whatever PBS actually granted and the guard below can trust it.
+    QUEUE="${QUEUE:-main}"
+    NCPUS="${NCPUS:-128}"
+    # derecho caps the main queue at 12 hours; a run too big for that resumes
+    WALLTIME="${WALLTIME:-12:00:00}"
+    # a main queue job gets the whole node's memory and needs no request; a
+    # shared develop job gets a flat 10 GB default whatever ncpus it asked for,
+    # which is less than the chunk caches want and quietly starves the run into
+    # re-decompressing everything, so a test has to ask for memory explicitly
+    MEM="${MEM:-}"
+
+    select="1:ncpus=${NCPUS}"
+    if [[ -n ${MEM} ]]; then
+        select="${select}:mem=${MEM}"
+    fi
+
+    qsub_args=(
+        -A "${PBS_ACCOUNT}"
+        -q "${QUEUE}"
+        -l "select=${select}"
+        -l "walltime=${WALLTIME}"
+    )
+    # job_priority is a main queue concept; the develop queue rejects it
+    if [[ ${QUEUE} == main ]]; then
+        qsub_args+=(-l job_priority=regular)
+    fi
+    # only one writer at a time can hold the icechunk branch, so a run too long
+    # for one walltime chains its jobs instead of overlapping them. The default
+    # is afterany, not afterok: a job stopped by walltime exits non-zero, and
+    # that is precisely the case the next job in the chain exists to resume.
+    DEPEND="${DEPEND:-afterany}"
+    if [[ -n ${AFTER:-} ]]; then
+        qsub_args+=(-W "depend=${DEPEND}:${AFTER}")
+    fi
     if [[ -n ${CONFIG:-} ]]; then
         qsub_args+=(-v "CONFIG=${CONFIG}")
     fi
@@ -62,18 +83,25 @@ CONFIG="${CONFIG:-config/config_zarr.yaml}"
 echo "job      ${PBS_JOBID:-interactive} on $(hostname)"
 echo "started  $(date)"
 echo "config   ${CONFIG}"
-echo "cpus     ${NCPUS:-unset}, memory ${PBS_MEM:-see select}"
+echo "queue    ${PBS_QUEUE:-unset}"
+# the true cpu count is reported by the guard below, which already starts python
 
-# num_workers lives in the config while ncpus lives here, so they can drift; an
-# oversubscribed run would multiply its chunks in flight straight past the
-# memory the job asked for
-workers=$(uv run python -c "
+# num_workers lives in the config while the job size lives here, so they can
+# drift; an oversubscribed run would multiply its chunks in flight straight past
+# the memory the job asked for.
+#
+# The cpu count comes from the affinity mask rather than $NCPUS or nproc, both of
+# which lie here: on a shared develop node PBS reports NCPUS=1 whatever it
+# granted, and nproc reports OMP_NUM_THREADS, which this script pins to 1.
+read -r workers available < <(uv run python -c "
+import os
 from utils.path_utils import load_config
-print(load_config('${CONFIG}').get('num_workers') or '')
+print(load_config('${CONFIG}').get('num_workers') or 0, len(os.sched_getaffinity(0)))
 ")
-if [[ -n ${workers} && -n ${NCPUS:-} ]] && (( workers > NCPUS )); then
-    echo "error: num_workers=${workers} in ${CONFIG} exceeds ncpus=${NCPUS}" >&2
-    echo "       raise ncpus in this script or lower num_workers in the config" >&2
+echo "workers  num_workers=${workers:-unset}, cpus available=${available}"
+if (( workers > available )); then
+    echo "error: num_workers=${workers} in ${CONFIG} exceeds the ${available} cpus" >&2
+    echo "       this job can use; raise ncpus or lower num_workers" >&2
     exit 1
 fi
 

@@ -39,11 +39,12 @@ Repository files:
 | --- | --- |
 | [gleam_zarr.py](gleam_zarr.py) | The pipeline: open, merge, chunk, write, resume |
 | [config/config_zarr.yaml](config/config_zarr.yaml) | The config that drives it |
-| [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Casper batch job wrapper |
+| [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
 | [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, batched writes, resume checks |
 | [utils/log_utils.py](utils/log_utils.py) | Logging to stdout and to the log file |
 | [draft_zarr.ipynb](draft_zarr.ipynb) | Exploratory scratch work, not part of the pipeline |
+| [TESTING.md](TESTING.md) | How the pipeline was validated and tuned, and what that found |
 
 ## Running it
 
@@ -61,12 +62,19 @@ uv run python gleam_zarr.py --config config/config_zarr.yaml
 ```
 
 A full build is far too heavy for a login node, so **submit it as a batch job**
-with [submit_gleam_zarr.sh](submit_gleam_zarr.sh), which requests a Casper node
+with [submit_gleam_zarr.sh](submit_gleam_zarr.sh), which requests a Derecho node
 and runs the same command inside it:
 
 ```bash
 ./submit_gleam_zarr.sh                                  # default config
 CONFIG=config/other.yaml ./submit_gleam_zarr.sh         # any other config
+
+# a short test on the shared develop queue, billed for the cpus it asks for
+QUEUE=develop NCPUS=8 WALLTIME=00:30:00 \
+    CONFIG=config/config_zarr_tiny.yaml ./submit_gleam_zarr.sh
+
+# chain a resume behind a running job so the two never write the store at once
+AFTER=<jobid> ./submit_gleam_zarr.sh
 ```
 
 Run outside PBS, the script hands itself to `qsub` with the account taken from
@@ -77,13 +85,24 @@ cannot expand a shell variable, and stock `qsub` reads only `PBS_DEFAULT` and
 `PBS_DPREFIX` from the environment. Submitting by hand still works if you want a
 different account: `qsub -A <PROJECT> submit_gleam_zarr.sh`.
 
-The job asks for `1 node / 8 cpus / 32 GB / 12 h`; edit the `#PBS` lines to
-change that. Before starting the build it checks
-`num_workers` in the config against the `ncpus` the job was given and refuses to
-start if the config asks for more, since an oversubscribed run would multiply
-its chunks in flight straight past the memory it reserved. If a run hits
-walltime, resubmit the same command — it resumes from the last commit.
-Resubmitting after a completed run is a no-op.
+The queue shape defaults to the production run — `main`, one whole node of 128
+cpus, 12 hours, Derecho's ceiling — and is overridden with the `QUEUE`, `NCPUS`
+and `WALLTIME` variables above rather than by editing `#PBS` lines, which are
+literal comments that cannot expand a variable. `job_priority` is added only on
+`main`, since the develop queue rejects it. Note that `main` allocates whole
+nodes exclusively, so a job there is billed for all 128 cpus whatever it uses,
+while `develop` is shared and bills only what it requests.
+
+Before starting the build the script checks `num_workers` in the config against
+the cpus the job can actually use and refuses to start if the config asks for
+more, since an oversubscribed run would multiply its chunks in flight straight
+past the memory it reserved. That count comes from the process affinity mask,
+because neither `$NCPUS` nor `nproc` is trustworthy here: on a shared develop
+node PBS reports `NCPUS=1` whatever it granted, and `nproc` reports
+`OMP_NUM_THREADS`, which the script pins to 1.
+
+If a run hits walltime, resubmit the same command — it resumes from the last
+commit. Resubmitting after a completed run is a no-op.
 
 Progress goes to both stdout and `<directories.logs>/<log_file>`; PBS job output
 lands in `logs/` as well. Logs and all data outputs are gitignored.
@@ -116,19 +135,22 @@ is [config/config_zarr.yaml](config/config_zarr.yaml).
 | `variables` | Either a list of variable names or the shorthand `all`. `all` expands to every variable directory actually present under `raw/<temporal_resolution>/`; an explicit list is kept in the order given, and a listed variable with no directory on disk is an error rather than a silent skip. |
 | `temporal_resolution` | Which resolution to build — `daily` here. Selects the subdirectory under `raw/`, and only the one configured is built. |
 | `grid_name` | Label for the grid the data is on (`native_0p1x0p1`). Used in the store name; it describes the data rather than reprojecting it, so changing it renames the output, it does not regrid. |
-| `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. `time: 5, lat: -1, lon: -1` gives whole global maps chunked five timesteps deep — 124 MiB per chunk on the 1800x3600 grid. This is the main knob on both the shape of the output and the memory a run takes; see below. |
+| `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. `time: 1, lat: -1, lon: -1` gives one whole global map per chunk — 24.7 MiB on the 1800x3600 grid — which is what the `spatial` suffix in the store name refers to: it is the layout for reading maps, and the worst one for reading a long time series at a point. This is the main knob on both the shape of the output and the memory a run takes; see below. |
 
-### The three settings that decide what a run costs
+### The four settings that decide what a run costs
 
 These are the keys worth setting deliberately before a long job.
-`timesteps_per_commit` decides how much work a crash throws away; the other two
-decide how much memory the run needs. Neither of the latter changes the store
-that gets written, only the resources used to write it.
+`timesteps_per_commit` decides how much work a crash throws away; the other
+three decide how fast the run goes and how much memory it needs. None of the
+latter three change the store that gets written, only the resources used to
+write it — and `chunk_cache_size_mib` is worth more than the other two put
+together.
 
 | Key | Default | What it controls |
 | --- | --- | --- |
-| `timesteps_per_commit` | 100 | Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
-| `num_workers` | dask's own, sized from the cpuset | Size of the dask thread pool, and so how many chunks are in flight — the dominant memory term, roughly `num_workers` x one chunk, about 1 GiB at 8 workers and 124 MiB chunks. It buys parallelism in exact proportion to the memory it costs. It **must not exceed the job's `ncpus`**: if you need more workers, raise `ncpus` in [submit_gleam_zarr.sh](submit_gleam_zarr.sh) rather than lowering the config, which the script checks and refuses to launch on. |
+| `timesteps_per_commit` | 100 | Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask — at the configured `time: 1` the rounding is a no-op, so this only bites if `time` is raised; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
+| `num_workers` | dask's own, sized from the cpuset | Size of the dask thread pool, and so how many chunks are in flight — roughly `num_workers` x one chunk, about 200 MiB at 8 workers and 24.7 MiB chunks — small enough at this chunk size that the open file cache below is the larger memory term. Note that it buys much less parallelism than it looks like it should: xarray locks every netCDF read behind one process-global HDF5 lock, so reads serialize no matter how many workers there are, and only the zarr compression on the write side scales. It **must not exceed the job's `ncpus`**: if you need more workers, raise `ncpus` in [submit_gleam_zarr.sh](submit_gleam_zarr.sh) rather than lowering the config, which the script checks and refuses to launch on. |
+| `chunk_cache_size_mib` | HDF5's own, ~16 MiB | Decompressed HDF5 chunk cache held per open netCDF file. **The single largest performance setting here.** The raw files are chunked `[12, 57, 113]` — twelve timesteps deep — while the store is written one timestep at a time, so unless this holds a whole twelve-deep row of chunks (1024 chunks, 302 MiB) HDF5 decompresses every chunk twelve times over. Measured on real data: reading twelve timesteps one at a time takes 9.06 s at the default and 0.87 s at 512 MiB, and 8.24 s vs 1.09 s end to end through xarray. It changes nothing about the store. Budget it against `file_cache_maxsize`, which multiplies it, and against `num_workers`, since threads reading distant timesteps touch different chunk rows. |
 | `file_cache_maxsize` | xarray's, 128 files | How many netCDF files stay open, each holding its own 64 MiB HDF5 chunk cache — the second memory term, and easy to overlook because the files are cheap but their caches are not. It only has to cover the files one batch touches, at most two year files per variable, so `32` is generous here and well below the several idle GiB the default would hold. |
 
 Both memory settings are applied by `configure_runtime` before anything opens a

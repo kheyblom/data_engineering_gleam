@@ -17,7 +17,9 @@ uv run python gleam_zarr.py --config config/config_zarr.yaml
 
 There is no test suite, linter, or CI configured; the
 notebook [draft_zarr.ipynb](draft_zarr.ipynb) is exploratory scratch work, not
-part of the pipeline. Progress is logged to both stdout and
+part of the pipeline. [TESTING.md](TESTING.md) records how the pipeline was
+validated and tuned before the first production build, including the two test
+configs that reproduce it and the reasons behind the execution settings. Progress is logged to both stdout and
 `logs/gleam_zarr.log` (gitignored, as are all data outputs — `*.nc`, `*.zarr/`,
 `figures/`).
 
@@ -52,16 +54,20 @@ resumes from the last commit rather than starting over.
 Batching bounds the unit of work, not the resident memory: each batch is
 streamed to the store chunk by chunk, so the `batch.nbytes` figure in the log
 (~34 GiB at the current settings) is not a memory figure. Peak memory is set by
-the chunks in flight — roughly `num_workers` x one chunk, 124 MiB at
-`time: 5` on the 1800x3600 grid — plus the HDF5 chunk cache each open netCDF
-file carries (64 MiB by default, `file_cache_maxsize` of them).
+the chunks in flight — roughly `num_workers` x one chunk, 24.7 MiB at
+`time: 1` on the 1800x3600 grid — plus the HDF5 chunk cache each open netCDF
+file carries (64 MiB by default, `file_cache_maxsize` of them). At 8 workers
+that is under 200 MiB of chunks against a 2 GiB file cache, so the cache, not
+the workers, is the larger term.
 
 Constraints that hold this together — breaking any of them breaks resume:
 
 - Batch size is always a whole number of time chunks (`commit_batch_size`
   rounds `timesteps_per_commit`, default 100, to the nearest multiple of the
   time chunk). xarray cannot append onto a partially filled chunk from dask, so
-  only the *final* batch may be short.
+  only the *final* batch may be short. At the configured `time: 1` every
+  integer is a whole number of chunks, so the rounding is a no-op and the batch
+  is exactly `timesteps_per_commit`; it starts to bite if `time` is raised.
 - The `time` coordinate is encoded with one chunk per batch, so each append
   lands on a chunk boundary.
 - On resume, `check_resume` compares stored variables and the overlapping
@@ -80,14 +86,30 @@ anything opens a file, since neither takes effect retroactively, and the
 resolved values are logged so a job killed for running out of memory can be read
 back against what it actually used.
 
-`num_workers` must not exceed the `ncpus` the batch job was given — the config
-is authoritative, so the job script is what gets adjusted to match. Left unset,
-dask sizes its pool from the cpuset instead. `file_cache_maxsize` only has to
-cover the files a single batch touches (two year files per variable at most), so
-it is set well below xarray's default of 128.
+`num_workers` must not exceed the cpus the batch job was actually given. Note
+the job script checks this against the affinity mask, not `$NCPUS` or `nproc`:
+on a shared develop node PBS reports `NCPUS=1` whatever it granted, and `nproc`
+reports `OMP_NUM_THREADS`, which the script pins to 1. Left unset, dask sizes
+its pool from the cpuset instead. `file_cache_maxsize` only has to cover the
+files a single batch touches (two year files per variable at most), so it is set
+well below xarray's default of 128.
+
+`chunk_cache_size_mib` matters more than either. The raw files are chunked
+`[12, 57, 113]`, twelve timesteps deep, while the store is written one timestep
+at a time, so unless the cache holds a whole twelve-deep row of chunks (302 MiB)
+every chunk is decompressed twelve times; setting it to 512 MiB measured 7.6x
+end to end. It is per open file, so worst-case memory here is
+`file_cache_maxsize` x `chunk_cache_size_mib`.
 
 ### Non-obvious details
 
+- The project is pinned to Python 3.13 (`requires-python = ">=3.13,<3.14"`).
+  On 3.14 numpy's temporary-elision optimisation misfires and segfaults on
+  `condition |= data == fill_value`, the CF masking in
+  `xarray/coding/variables.py`, for any temporary above the elision threshold.
+  Every read of a full lat/lon slab goes through that line, so the pipeline
+  cannot read a single chunk on 3.14; the same numpy and xarray are fine on
+  3.13. Do not raise the Python cap without re-running the tiny test config.
 - `parallel=True` is deliberately omitted from `open_mfdataset`: opening netCDF
   from several threads crashes the HDF5 library in this build. Do not add it.
 - The netCDF encoding xarray carries over (`zlib`, `chunksizes`, ...) is

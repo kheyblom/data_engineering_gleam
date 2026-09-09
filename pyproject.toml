@@ -1,7 +1,10 @@
 [project]
 name = "data_engineering_gleam"
 version = "0.1.0"
-requires-python = ">=3.14"
+# capped below 3.14: on 3.14 numpy's temporary elision misfires and segfaults on
+# `condition |= data == fill_value` in xarray's CF masking, which every read of a
+# full lat/lon slab goes through. Same numpy, same xarray, no crash on 3.13.
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "cartopy>=0.25.0",
     "cftime>=1.6.5",

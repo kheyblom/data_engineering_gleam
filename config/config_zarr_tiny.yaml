@@ -1,0 +1,33 @@
+# Tier 1 correctness config: a staged tree of symlinks holding two variables for
+# one year, so a full build, a resume, and a rerun all finish in minutes. Every
+# path key differs from the production config, so this can never touch the real
+# store. The tree is symlinks into the real raw data and is rebuilt on demand,
+# so it is staged from a throwaway script rather than one kept in the repo.
+directories:
+  download: /glade/derecho/scratch/kheyblom/data/gleam_tiny/
+  logs: ./logs
+output_conventions:
+  filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
+  # not 'spatial': the staged tree already isolates this store by directory, but
+  # a distinct name means a mistyped path cannot quietly resolve to a real store
+  suffix: tiny
+log_file: gleam_zarr_tiny.log
+version: v4.3a
+# 'all' expands against what is on disk, which in the staged tree is E and SMs
+variables: all
+temporal_resolution: daily
+grid_name: native_0p1x0p1
+chunks:
+  time: 1
+  lat: -1
+  lon: -1
+# 366 staged timesteps give 3 full batches and a 66 step final one, so the short
+# final batch is exercised rather than assumed
+timesteps_per_commit: 100
+num_workers: 4
+file_cache_maxsize: 32
+# the raw files are chunked 12 timesteps deep while the store is written one
+# timestep at a time, so this has to hold a whole 12 deep row of chunks (302 MiB)
+# or HDF5 decompresses each one twelve times over; measured 7.6x end to end.
+# Costs file_cache_maxsize x this much memory in the worst case.
+chunk_cache_size_mib: 512
