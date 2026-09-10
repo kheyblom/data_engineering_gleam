@@ -14,6 +14,11 @@ package install step — `gleam_zarr.py` is run directly from the repo root.
 uv sync                                             # create/refresh .venv from uv.lock
 uv run python gleam_zarr.py --config config/config_zarr.yaml
 uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
+
+# finalization; writes nothing without --apply, one action per invocation
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --tag NAME
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
 ```
 
 There is no test suite, linter, or CI configured; the
@@ -29,6 +34,14 @@ configs that reproduce it, the reasons behind the execution settings, and the
 full verification of the v4.3a store. Progress is logged to both stdout and
 `logs/gleam_zarr.log` (gitignored, as are all data outputs — `*.nc`, `*.zarr/`,
 `figures/`).
+
+`finalize_gleam_zarr.py` is the only script here that **mutates** a finished
+store: it writes global attributes, creates a tag, or garbage collects
+unreachable objects. Two standing rules. The verifier stays read only — do not
+add a destructive flag to it, because it is what proves a finalization step did
+no harm, and a tool that both acts and audits answers two questions with one
+exit status. And `--gc --apply` is irreversible: run it without `--apply` first,
+and re-run `verify_gleam_zarr.py --phases structure,sweep` afterwards.
 
 Large runs are long enough to need a batch job; the resume behaviour below
 exists so a run killed by walltime can simply be relaunched with the same
@@ -132,7 +145,15 @@ end to end. It is per open file, so worst-case memory here is
   1982 and 1992) while every other variable, including E's own components, has
   data there. That is an upstream GLEAM gap, not a build failure; a short chunk
   count is not a reason to rebuild. `verify_gleam_zarr.py` traces every hole
-  back to raw for this reason.
+  back to raw for this reason, and the store's own `known_data_gaps` attribute
+  records it so a downstream consumer does not have to rediscover it.
+- Every write through `to_icechunk` **forks** the session, and the fork's
+  snapshot is not in the branch's ancestry, so a store accumulates one
+  unreachable snapshot per commit as a matter of course. A count of unreachable
+  snapshots close to the batch count is normal, not damage — read it against
+  `len(ancestry(...))` and the object count in `snapshots/` before concluding
+  anything. `expire_snapshots` is never needed to clean these up, and reclaims
+  essentially no bytes; `garbage_collect` alone is the right tool.
 - `merge_variables` requires an exact time-axis match across variables and
   merges with `join='exact'`; a mismatch means an incomplete download and would
   otherwise surface as a silently NaN-filled variable.
@@ -159,6 +180,11 @@ second validation script is committed**, and name the directory `validation/`
 rather than `tests/`. This is not a pytest suite: it audits a 1 TiB artifact,
 needs the raw tree staged on GLADE, and runs for ~9 minutes, so anything that
 collects `tests/` would pick up a file that cannot run off Derecho.
+
+`finalize_gleam_zarr.py` (added 2026-09-10) is a **third** root-level entry
+point, and it does not change that decision: the trigger stated above is a
+second *validation* script, and this is not one. It sits at the root for the
+same reason the other two do.
 
 Whichever way that goes, do not paper over the import with `sys.path.insert`.
 

@@ -31,3 +31,12 @@ file_cache_maxsize: 32
 # or HDF5 decompresses each one twelve times over; measured 7.6x end to end.
 # Costs file_cache_maxsize x this much memory in the worst case.
 chunk_cache_size_mib: 512
+
+# a minimal attrs section, so a tiny run exercises the same attribute path the
+# production build and finalize_gleam_zarr.py use rather than skipping it
+attrs:
+  title: 'TEST STORE -- GLEAM {version_label} {temporal_resolution}, staged subset, not for use'
+  Conventions: ACDD-1.3
+  comment: >-
+    Built from config_zarr_tiny.yaml against a staged tree of two variables for
+    one year. A correctness fixture, not data.

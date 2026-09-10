@@ -38,6 +38,8 @@ Repository files:
 | Path | What it is |
 | --- | --- |
 | [gleam_zarr.py](gleam_zarr.py) | The pipeline: open, merge, chunk, write, resume |
+| [verify_gleam_zarr.py](verify_gleam_zarr.py) | Audits a finished store against the raw files. Read only throughout |
+| [finalize_gleam_zarr.py](finalize_gleam_zarr.py) | Writes attributes, tags a snapshot, collects unreachable objects. The only script here that mutates a finished store |
 | [config/config_zarr.yaml](config/config_zarr.yaml) | The config that drives it |
 | [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
@@ -45,6 +47,70 @@ Repository files:
 | [utils/log_utils.py](utils/log_utils.py) | Logging to stdout and to the log file |
 | [draft_zarr.ipynb](draft_zarr.ipynb) | Exploratory scratch work, not part of the pipeline |
 | [TESTING.md](TESTING.md) | How the pipeline was validated and tuned, and what that found |
+
+## Where the finished store lives
+
+The v4.3a daily store is built, verified and finalized:
+
+```
+/glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr
+```
+
+16802 timesteps, 14 variables, 1980-01-01 .. 2025-12-31 on the 1800x3600 grid;
+1.032 TiB compressed, 0.186 of logical. Verified against the source netCDF files
+on 2026-09-10 and tagged **`v4.3a-verified-20260910`**.
+
+Read it through the tag rather than the branch. A tag in icechunk is immutable,
+so it cannot be moved by a later commit, and `consolidated=False` is required —
+icechunk's manifest does the job zarr's consolidated metadata would:
+
+```python
+import icechunk
+import xarray as xr
+
+path = ('/glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/'
+        'gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr')
+repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
+session = repository.readonly_session(tag='v4.3a-verified-20260910')
+dataset = xr.open_zarr(session.store, consolidated=False)
+```
+
+The store describes itself: `dataset.attrs` carries the provenance, the coverage
+and grid extents, a `chunking` note on what this layout is and is not good for,
+and `known_data_gaps` recording that `E` is absent on 25 upstream-missing days.
+
+**It is on scratch, which is purged.** That is a deliberate, accepted risk —
+moving it to `/glade/campaign/univ/umic0112` is a separate piece of work. Until
+then the store should be treated as reproducible rather than archived: rebuilding
+it costs ~57 core-hours, and the raw tree it is built from (~1.7 TiB) sits on the
+same purge-prone filesystem.
+
+## Finalizing a store
+
+Once a store has been verified, [finalize_gleam_zarr.py](finalize_gleam_zarr.py)
+does the three things that turn it into a deliverable. It takes exactly one
+action per run and writes nothing without `--apply`:
+
+```bash
+# write the config's attrs section plus the derived coverage and grid attributes
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs --apply
+
+# name the current branch tip; tags are immutable
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml \
+    --tag v4.3a-verified-20260910 --apply
+
+# delete objects no surviving snapshot references
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+```
+
+`--gc` is the irreversible one. Every write through `to_icechunk` forks the
+session, and the fork's snapshot is not part of the branch's ancestry, so a
+store accumulates one unreachable snapshot per commit as a matter of course —
+plus the chunks of any batch killed before it could commit. Collection removes
+only what nothing references, and the script checks that claim by comparing
+reachable bytes and history length either side of the call. Run
+`verify_gleam_zarr.py --phases structure,sweep` afterwards regardless: the sweep
+is the only full-coverage check there is.
 
 ## Running it
 
@@ -117,6 +183,7 @@ is [config/config_zarr.yaml](config/config_zarr.yaml).
 | Key | Meaning |
 | --- | --- |
 | `download` | Root of the tree the download step wrote. The version directory, `raw/`, and the `zarr/` output directory all hang off this. |
+| `raw` | Optional. Root of the tree holding the raw netCDF files, when they are not under `download`. Like `download` it is the root *above* the version directory, not the `raw/` segment itself. Unset, it falls back to `download`, which is what every config here does. It exists so a store that has been moved can still be verified against raw files that did not move with it — `store_path` follows `download`, so without this the inputs and outputs are pinned to the same filesystem. |
 | `logs` | Where the log file is written. Created if it does not exist. |
 
 ### `output_conventions`
@@ -125,6 +192,23 @@ is [config/config_zarr.yaml](config/config_zarr.yaml).
 | --- | --- |
 | `filename` | Template for the store name. Any scalar at the top level of the config, plus any key under `output_conventions`, can be referenced by name; `{version}` is substituted in its on-disk form (`v_4_3_a`). Referring to a field the config does not define is an error. |
 | `suffix` | A free-form tag fed to the template — `spatial` here — to distinguish stores built from the same source with different chunking or post-processing. |
+
+### `attrs`
+
+Optional. The store's global attributes, written by `gleam_zarr.py` on the first
+batch and by `finalize_gleam_zarr.py --attrs` onto a store that already exists.
+Each string value is a template over the same fields the `filename` template
+uses, with `{version_label}` for the version as the config writes it (`v4.3a`)
+alongside `{version}` for the on-disk spelling (`v_4_3_a`).
+
+Three things stay out of this section deliberately. The coverage and grid
+attributes (`time_coverage_*`, `geospatial_*`) are derived from the data by
+`derive_attrs`, so they cannot drift from what was actually written. The source
+files' own attributes are carried over by the merge and kept underneath these,
+so GLEAM's upstream provenance survives. And `Conventions` is `ACDD-1.3` rather
+than a CF version: the variables' `standard_name` and `units` come through
+unaltered from upstream and are not CF-valid, which the `cf_compliance`
+attribute states outright rather than leaving a consumer to discover.
 
 ### Top-level keys
 

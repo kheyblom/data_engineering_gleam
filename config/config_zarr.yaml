@@ -21,3 +21,61 @@ file_cache_maxsize: 32
 # or HDF5 decompresses each one twelve times over; measured 7.6x end to end.
 # Costs file_cache_maxsize x this much memory in the worst case.
 chunk_cache_size_mib: 512
+
+# Store global attributes. Every string is templated over the same config fields
+# the filename template uses, so {version_label} and friends stay in one place.
+# Coverage and grid attributes are not here: derive_attrs reads them off the
+# data so they cannot drift from what was actually written.
+attrs:
+  title: >-
+    GLEAM {version_label} daily land evaporation and soil moisture,
+    native 0.1 degree global grid, 1980-2025
+  summary: >-
+    All 14 GLEAM {version_label} daily variables merged onto one time/lat/lon
+    grid and stored as a single icechunk-backed zarr store: actual (E),
+    potential (Ep) and open-water (Ew) evaporation, the aerodynamic (Ep_aero)
+    and radiative (Ep_rad) components of Ep, the components of E -- bare soil
+    (Eb), condensation (Ec), interception loss (Ei), snow sublimation (Es) and
+    transpiration (Et) -- sensible heat flux (H), evaporative stress (S), and
+    surface (SMs) and root-zone (SMrz) soil moisture.
+  # ACDD rather than CF, deliberately: see cf_compliance
+  Conventions: ACDD-1.3
+  cf_compliance: >-
+    Not CF compliant. Each variable's standard_name and units are carried
+    through unaltered from the upstream GLEAM netCDF files, so the
+    standard_name values are descriptive strings rather than CF standard names
+    ('Actual evaporation', not 'water_evaporation_flux') and the units are
+    spelled 'mm.day-1' and 'm3.m-3', which udunits does not parse. Correcting
+    them would mean diverging from upstream, so they are left as published.
+  source: >-
+    GLEAM {version_label} daily netCDF files, 644 files covering 14 variables
+    x 46 years, one file per variable-year
+  history: >-
+    2026-09-09/2026-09-10: converted from the GLEAM netCDF files to this
+    icechunk-backed zarr store by gleam_zarr.py (data_engineering_gleam @
+    74a3eaa) in 169 append commits; 2026-09-10: global attributes added by
+    finalize_gleam_zarr.py
+  date_created: '2026-09-10T10:24:11Z'
+  creator_name: Kyle Heyblom
+  creator_email: heyblom@umich.edu
+  references: >-
+    https://www.gleam.eu/ -- the dataset citations are in the Reference1 and
+    Reference2 attributes carried over from the source files
+  chunking: >-
+    Chunked (time, lat, lon) = (1, 1800, 3600), float32, zstd: one whole global
+    map per chunk, 24.7 MiB. Built for reading maps and fields. A point time
+    series is the worst case for this layout, touching all 16802 chunks of a
+    variable; if that access pattern matters, build a second store chunked
+    along time rather than reading this one that way.
+  known_data_gaps: >-
+    Variable E is entirely fill (NaN) on 25 days -- five 5-day blocks,
+    1982-02-05..02-09 and 1992-01-01..01-05, 03-21..03-25, 05-20..05-24 and
+    10-02..10-06 -- while every other variable, including E's own components,
+    has data on those days. This is a gap in upstream GLEAM {version_label},
+    not a conversion defect. Zarr does not write a chunk whose cells are all
+    fill, so E holds 16777 chunks against 16802 timesteps and that is correct.
+  verification: >-
+    Verified 2026-09-10 against the source netCDF files by verify_gleam_zarr.py:
+    103 checks, 0 failures across structure, index, samples, sweep (all 235228
+    chunks), component identities and physical ranges. Value comparisons are
+    bit-exact, not approximate.

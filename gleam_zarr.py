@@ -29,6 +29,7 @@ import argparse
 import os
 
 from utils.path_utils import (
+    format_attrs,
     load_config,
     raw_dir,
     resolve_variables,
@@ -44,6 +45,7 @@ from utils.zarr_utils import (
     commit_batch_size,
     committed_timesteps,
     configure_runtime,
+    derive_attrs,
     merge_variables,
     open_repository,
     open_variable,
@@ -91,10 +93,16 @@ def build_dataset(settings, variables):
     # yearly file boundaries until they are squared up here
     dataset = dataset.chunk(chunks)
 
+    # merge_variables carries the source files' own attributes over; the derived
+    # and configured ones go on top of those so upstream provenance survives
+    # beside them. Only the first batch writes them, since later batches append
+    dataset.attrs.update(derive_attrs(dataset) | format_attrs(settings))
+
     LOG.info(
         f'merged {len(dataset.data_vars)} variables: '
         f'{dict(dataset.sizes)}, {dataset.nbytes / 1024**4:.2f} TiB'
     )
+    LOG.info(f'carrying {len(dataset.attrs)} global attributes')
     LOG.info(f'chunking as {chunks}')
     return dataset, chunks
 
