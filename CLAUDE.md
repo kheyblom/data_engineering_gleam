@@ -15,7 +15,9 @@ uv sync                                             # create/refresh .venv from 
 uv run python gleam_zarr.py --config config/config_zarr.yaml
 uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
 
-# finalization; writes nothing without --apply, one action per invocation
+# finalization; writes nothing without --apply, one action per invocation.
+# --status first: it reports which steps a store still needs
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
 uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
 uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --tag NAME
 uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
@@ -42,6 +44,11 @@ add a destructive flag to it, because it is what proves a finalization step did
 no harm, and a tool that both acts and audits answers two questions with one
 exit status. And `--gc --apply` is irreversible: run it without `--apply` first,
 and re-run `verify_gleam_zarr.py --phases structure,sweep` afterwards.
+
+The write order — `--attrs`, then `--tag`, then `--gc` — is load-bearing, not a
+style preference: tags are immutable, so one created before the attributes exist
+permanently names a store that does not describe itself. The README carries the
+procedure with its gates and its failure path; do not improvise a shorter one.
 
 Large runs are long enough to need a batch job; the resume behaviour below
 exists so a run killed by walltime can simply be relaunched with the same

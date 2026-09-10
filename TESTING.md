@@ -480,6 +480,11 @@ meaningful next to `len(ancestry(...))` and the object count on disk, and those
 two commands would have cost seconds. The missing comparison deferred a safe,
 free cleanup and put a wrong conclusion in this file.
 
+That is now a single command rather than a habit to remember:
+`finalize_gleam_zarr.py --status` prints the three numbers together — reachable
+history, objects on disk, and what is unreachable — and is step 1 of the
+documented procedure for exactly this reason.
+
 Two smaller things worth keeping:
 
 - **`overwritten/` is not self-cleaning.** It holds superseded copies of the

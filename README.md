@@ -87,30 +87,93 @@ same purge-prone filesystem.
 
 ## Finalizing a store
 
-Once a store has been verified, [finalize_gleam_zarr.py](finalize_gleam_zarr.py)
-does the three things that turn it into a deliverable. It takes exactly one
-action per run and writes nothing without `--apply`:
+Turning a verified store into a deliverable is a fixed procedure, run by
+[finalize_gleam_zarr.py](finalize_gleam_zarr.py). It takes exactly one action
+per invocation and writes nothing without `--apply`, so every step can be
+previewed before it happens.
+
+**The order is load-bearing**, which is the one thing to get right:
+
+1. `--attrs` first, so the snapshot the tag names already carries the
+   provenance.
+2. `--tag` second. Tags are immutable and cannot be moved, so a tag created
+   before the attributes exist permanently names a store that does not describe
+   itself.
+3. `--gc` last. A tag is a ref, so tagging first makes the reachability set
+   explicit rather than leaving it implicit in wherever `main` happens to point.
+
+`--status` reports where a store already stands, including which of the three
+steps remain, so the order does not have to be remembered:
 
 ```bash
-# write the config's attrs section plus the derived coverage and grid attributes
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
+```
+
+### The procedure
+
+```bash
+# 0. pre-flight. Only one writer can hold the icechunk branch, so no build or
+#    resume job may be running against this store
+qstat -u $USER
+
+# 1. baseline, and the state to compare everything against afterwards
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
+
+# 2. attributes. Preview, then apply
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
 uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs --apply
 
-# name the current branch tip; tags are immutable
+# 3. tag. Convention is <version>-verified-<YYYYMMDD>, dated so a later
+#    re-verification can add its own tag without ambiguity
 uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml \
     --tag v4.3a-verified-20260910 --apply
 
-# delete objects no surviving snapshot references
+# 4. collect unreachable objects. Read the dry run before applying
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
 uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+
+# 5. gates
+uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
+    --phases structure,sweep                       # ~35 s, full chunk coverage
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+                                                   # must report all zeros
+uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
+                                                   # ~9 min, the final word
 ```
 
-`--gc` is the irreversible one. Every write through `to_icechunk` forks the
-session, and the fork's snapshot is not part of the branch's ancestry, so a
-store accumulates one unreachable snapshot per commit as a matter of course —
-plus the chunks of any batch killed before it could commit. Collection removes
-only what nothing references, and the script checks that claim by comparing
-reachable bytes and history length either side of the call. Run
-`verify_gleam_zarr.py --phases structure,sweep` afterwards regardless: the sweep
-is the only full-coverage check there is.
+All of it runs on a login node for free. Step 4 is the only irreversible one.
+
+### Reading a garbage collection summary
+
+**A count of unreachable objects means nothing on its own.** "171 snapshots"
+reads equally as *the entire commit history* and as *171 objects nothing points
+at*, and this repo once recorded the wrong one of those and deferred a safe
+cleanup for a day over it (TESTING.md, finding 9). It only becomes meaningful
+against the reachable history and the objects actually on disk, which is what
+`--status` prints together and why it is step 1.
+
+For the record, unreachable snapshots are **expected and normal**: every write
+through `to_icechunk` forks the session, and the fork's snapshot never joins the
+branch ancestry, so a store accumulates one per commit as a matter of course.
+Orphaned *chunks*, by contrast, come from batches killed before they could
+commit. So the snapshot count scales with the length of the run and the chunk
+count does not — 169 batches plus 2 killed gave exactly 171 fork snapshots and
+2012 orphaned chunks.
+
+`garbage_collect` deletes an object only if no surviving snapshot references it.
+`expire_snapshots` is **not** part of this procedure: it reclaims essentially no
+bytes, since the branch tip already references every live chunk, and all it
+would do is discard the build's history.
+
+### If a gate fails
+
+`--gc --apply` compares reachable bytes and history length either side of the
+collection and exits non-zero if either moved, since collection is defined not
+to change them. If that trips, or if the `sweep` phase reports a missing chunk
+that raw says should hold data, **the store is damaged and there is no undo** —
+garbage collection cannot be reversed. Recovery is a restore from another copy
+if one exists, and a rebuild (~57 core-hours) if one does not. This is the
+reason to know whether a second copy exists *before* running step 4.
 
 ## Running it
 

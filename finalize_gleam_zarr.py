@@ -6,8 +6,17 @@ finalization step did no harm, so it stays read only and safe to run by reflex;
 a tool that both acted and audited would report one exit status for two
 questions.
 
-Three actions, exactly one per invocation:
+Four actions, exactly one per invocation. The three that write must be run in
+the order below: a tag is immutable, so tagging before the attributes exist
+permanently names a store that does not describe itself, and tagging before
+collection makes the reachability set explicit rather than implicit in wherever
+``main`` points. ``--status`` reports which of them a store still needs.
 
+``--status``
+    Where the store stands: attributes written and pending, tags, reachable
+    history, the objects on disk, what is unreachable, and what remains to do.
+    Reads only, and the thing to run first -- an unreachable object count is
+    not interpretable without the reachable history beside it.
 ``--attrs``
     Write the config's ``attrs`` section, plus the coverage and grid attributes
     derived from the data, onto the store's root group. Additive: it rewrites
@@ -21,7 +30,8 @@ Three actions, exactly one per invocation:
     left behind by batches that were killed before they could commit.
 
 Nothing happens without ``--apply``: by default each action reports what it
-would do and exits. ``--gc --apply`` is **irreversible**. It is safe in the
+would do and exits, so every step can be previewed. The full procedure, its
+gates, and what to do when one fails are in the README. ``--gc --apply`` is **irreversible**. It is safe in the
 sense that icechunk only ever collects unreachable objects, and this script
 checks that claim by comparing reachable bytes and history length either side
 of the call, but a store with no second copy has nothing to restore from if
@@ -45,6 +55,9 @@ from utils.zarr_utils import BRANCH, derive_attrs, open_existing_repository
 
 LOG = logging.getLogger(__name__)
 
+# the repository's on-disk object directories, in the order worth reading them
+STORE_DIRECTORIES = ('chunks', 'manifests', 'snapshots', 'transactions', 'overwritten')
+
 
 def parse_args():
     """Parse command line arguments.
@@ -64,6 +77,11 @@ def parse_args():
         '--attrs', action='store_true', help='Write global attributes.'
     )
     action.add_argument('--tag', help='Create this tag at the branch tip.')
+    action.add_argument(
+        '--status',
+        action='store_true',
+        help='Report where the store stands in the procedure. Reads only.',
+    )
     action.add_argument(
         '--gc', action='store_true', help='Delete unreachable objects.'
     )
@@ -94,6 +112,83 @@ def resolve_attrs(repository, settings):
     dataset = xr.open_zarr(session.store, consolidated=False)
     current = dict(dataset.attrs)
     return current | derive_attrs(dataset) | format_attrs(settings), current
+
+
+def object_counts(path):
+    """Count the objects in each of the repository's on-disk directories.
+
+    Args:
+        path (str): Directory holding the store.
+
+    Returns:
+        dict: Directory name -> number of objects in it.
+    """
+    counts = {}
+    for name in STORE_DIRECTORIES:
+        directory = os.path.join(path, name)
+        if os.path.isdir(directory):
+            counts[name] = len(os.listdir(directory))
+    return counts
+
+
+def run_status(repository, settings, path):
+    """Report where a store stands in the finalization procedure.
+
+    Reads only, and the measurement that makes a garbage collection summary
+    interpretable. A count of unreachable snapshots means nothing on its own --
+    it reads equally as "the whole commit history" and as "objects nothing
+    points at" -- and everything next to the reachable history and the objects
+    actually on disk. Reading one without the others is what deferred this
+    store's cleanup for a day; see finding 9 in TESTING.md.
+
+    Args:
+        repository (icechunk.Repository): The repository holding the store.
+        settings (dict): The loaded configuration.
+        path (str): Directory holding the store.
+
+    Returns:
+        int: 0.
+    """
+    merged, current = resolve_attrs(repository, settings)
+    pending = [
+        key for key in merged if key not in current or merged[key] != current[key]
+    ]
+    reachable = len(list(repository.ancestry(branch=BRANCH)))
+    tags = repository.list_tags()
+
+    LOG.info(f'attributes    {len(current)} written, {len(pending)} pending')
+    LOG.info(f'tags          {sorted(tags) or "none"}')
+    LOG.info(
+        f'reachable     {repository.chunk_storage_stats().native_bytes / 1024**4:.4f} '
+        f'TiB across {reachable} snapshots'
+    )
+    for name, count in object_counts(path).items():
+        # the orphan count is the whole point: it is what a garbage collection
+        # summary has to be read against before it means anything
+        note = (
+            f'  ({reachable} reachable, {count - reachable} orphaned)'
+            if name == 'snapshots'
+            else ''
+        )
+        LOG.info(f'on disk       {name:13s} {count}{note}')
+
+    summary = repository.garbage_collect(
+        datetime.datetime.now(datetime.timezone.utc), dry_run=True
+    )
+    LOG.info(f'unreachable   {summarize(summary)}')
+
+    # spell out what is left, so the order does not have to be remembered
+    remaining = []
+    if pending:
+        remaining.append('--attrs')
+    if not tags:
+        remaining.append('--tag NAME')
+    if summary.bytes_deleted or summary.snapshots_deleted:
+        remaining.append('--gc')
+    LOG.info(
+        f'remaining     {" then ".join(remaining) or "nothing, this store is finalized"}'
+    )
+    return 0
 
 
 def run_attrs(repository, settings, apply_changes):
@@ -245,12 +340,14 @@ def main(settings, args):
     """
     path = store_path(settings)
     LOG.info(f'finalizing {path}')
-    if not args.apply:
+    if not args.apply and not args.status:
         LOG.info('--apply not given: reporting only, nothing will be written')
     # Repository.open rather than open_or_create, so a mistyped path fails here
     # instead of producing an empty repository that every later step agrees with
     repository = open_existing_repository(path)
 
+    if args.status:
+        return run_status(repository, settings, path)
     if args.attrs:
         return run_attrs(repository, settings, args.apply)
     if args.tag:
