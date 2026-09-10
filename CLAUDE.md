@@ -13,13 +13,20 @@ package install step — `gleam_zarr.py` is run directly from the repo root.
 ```bash
 uv sync                                             # create/refresh .venv from uv.lock
 uv run python gleam_zarr.py --config config/config_zarr.yaml
+uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
 ```
 
 There is no test suite, linter, or CI configured; the
 notebook [draft_zarr.ipynb](draft_zarr.ipynb) is exploratory scratch work, not
-part of the pipeline. [TESTING.md](TESTING.md) records how the pipeline was
+part of the pipeline. `verify_gleam_zarr.py` audits a *finished* store against
+the raw files — six phases selectable with `--phases`, read only throughout,
+non-zero exit on any failure. Its `sweep` phase is the only full-coverage check
+available: it audits all 235,228 chunks off the manifest in ~30 s without
+reading data, so it is the thing to run first after any rebuild.
+[TESTING.md](TESTING.md) records how the pipeline was
 validated and tuned before the first production build, including the two test
-configs that reproduce it and the reasons behind the execution settings. Progress is logged to both stdout and
+configs that reproduce it, the reasons behind the execution settings, and the
+full verification of the v4.3a store. Progress is logged to both stdout and
 `logs/gleam_zarr.log` (gitignored, as are all data outputs — `*.nc`, `*.zarr/`,
 `figures/`).
 
@@ -118,6 +125,14 @@ end to end. It is per open file, so worst-case memory here is
 - `chunks: -1` in the config means the whole dimension, resolvable only once
   the files are open (`resolve_chunks`). `open_mfdataset` chunks per file, so
   time chunks follow yearly file boundaries until the explicit `.chunk()`.
+- Zarr does not write a chunk whose cells are all equal to the fill value, so
+  a variable can hold fewer chunks than there are timesteps and still be
+  correct — the hole reads back as NaN, which is what an all-fill raw plane
+  decodes to. In v4.3a `E` is entirely -999 on 25 days (five 5-day blocks in
+  1982 and 1992) while every other variable, including E's own components, has
+  data there. That is an upstream GLEAM gap, not a build failure; a short chunk
+  count is not a reason to rebuild. `verify_gleam_zarr.py` traces every hole
+  back to raw for this reason.
 - `merge_variables` requires an exact time-axis match across variables and
   merges with `join='exact'`; a mismatch means an incomplete download and would
   otherwise surface as a silently NaN-filled variable.
@@ -128,3 +143,25 @@ Single quotes, f-strings for log messages, Google-style docstrings with Args /
 Returns / Raises on every non-trivial function. Comments explain *why* a choice
 was made (the HDF5 threading note, the chunk-boundary rule), not what the line
 does. Module docstrings carry the context needed to read the file.
+
+### Layout
+
+Both entry points — `gleam_zarr.py` and `verify_gleam_zarr.py` — sit at the
+repo root, and `utils/` is importable only because a script's own directory is
+what lands on `sys.path`. That is why there is no install step, and it is the
+constraint any reorganisation runs into first: moving either script into a
+subdirectory breaks `from utils...` immediately.
+
+Considered and declined 2026-09-10, at one validation script: a subdirectory
+would mean adding `[build-system]` to `pyproject.toml` so `uv sync` installs
+the project editable. Worth doing, but not for one file — **revisit when a
+second validation script is committed**, and name the directory `validation/`
+rather than `tests/`. This is not a pytest suite: it audits a 1 TiB artifact,
+needs the raw tree staged on GLADE, and runs for ~9 minutes, so anything that
+collects `tests/` would pick up a file that cannot run off Derecho.
+
+Whichever way that goes, do not paper over the import with `sys.path.insert`.
+
+Test configs stay in `config/` beside the production one — they are inputs to
+`gleam_zarr.py`, not to the verifier, and one home for all configs beats
+splitting them by purpose.
