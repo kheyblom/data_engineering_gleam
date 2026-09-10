@@ -72,6 +72,31 @@ def version_root(settings):
     )
 
 
+def raw_root(settings):
+    """Root of the tree holding the raw netCDF files.
+
+    Falls back to ``directories.download`` so every config written before the
+    raw and store roots became separable keeps working. The separate key exists
+    because a relocated store has to stay verifiable against raw files that did
+    not move with it: ``store_path`` follows ``download``, so without this the
+    inputs and the outputs are pinned to the same filesystem.
+
+    Like ``download``, ``directories.raw`` is the root *above* the version
+    directory, not the ``raw`` segment itself.
+
+    Args:
+        settings (dict): The loaded configuration.
+
+    Returns:
+        str: e.g. '<raw or download>/v_4_3_a'.
+    """
+    directories = settings['directories']
+    return os.path.join(
+        directories.get('raw') or directories['download'],
+        format_version(settings['version']),
+    )
+
+
 def raw_dir(settings):
     """Directory holding the raw netCDF files for the configured resolution.
 
@@ -79,12 +104,40 @@ def raw_dir(settings):
         settings (dict): The loaded configuration.
 
     Returns:
-        str: e.g. '<download>/v_4_3_a/raw/daily'; its subdirectories are the
-            variables.
+        str: e.g. '<raw or download>/v_4_3_a/raw/daily'; its subdirectories are
+            the variables.
     """
     return os.path.join(
-        version_root(settings), RAW_DIRNAME, settings['temporal_resolution']
+        raw_root(settings), RAW_DIRNAME, settings['temporal_resolution']
     )
+
+
+def template_fields(settings):
+    """Config fields a ``str.format`` template may reference.
+
+    Every scalar at the top level of the config, plus everything under
+    ``output_conventions``; nested sections are skipped because only scalars
+    render usefully into a string. ``version`` is substituted in its directory
+    form so rendered text carries the same spelling as the input tree, and
+    ``version_label`` holds it as the config writes it.
+
+    Args:
+        settings (dict): The loaded configuration.
+
+    Returns:
+        dict: Field name -> value.
+    """
+    fields = {
+        key: value
+        for key, value in settings.items()
+        if isinstance(value, (str, int, float))
+    }
+    fields.update(settings.get('output_conventions', {}))
+    # a filename carries the directory spelling, but prose wants the version as
+    # it is actually written, so both are offered rather than one converted
+    fields['version_label'] = settings['version']
+    fields['version'] = format_version(settings['version'])
+    return fields
 
 
 def format_filename(settings):
@@ -103,17 +156,7 @@ def format_filename(settings):
     Raises:
         ValueError: If the template refers to a field the config does not define.
     """
-    # flatten the config into the fields the template may reference; only scalars
-    # are useful in a filename, so nested sections are skipped
-    fields = {
-        key: value
-        for key, value in settings.items()
-        if isinstance(value, (str, int, float))
-    }
-    fields.update(settings.get('output_conventions', {}))
-    # the store name carries the same version spelling as the input directories
-    fields['version'] = format_version(settings['version'])
-
+    fields = template_fields(settings)
     template = settings['output_conventions']['filename']
     try:
         return template.format_map(fields)
@@ -122,6 +165,41 @@ def format_filename(settings):
             f'filename template {template!r} refers to {error} '
             f'which is not set in the config'
         ) from None
+
+
+def format_attrs(settings):
+    """Render the config's ``attrs`` section into store global attributes.
+
+    Each string value is a template over the same fields ``format_filename``
+    uses, so attribute text can refer to ``{version}`` or ``{grid_name}``
+    instead of repeating them and drifting from the rest of the config.
+
+    Args:
+        settings (dict): The loaded configuration.
+
+    Returns:
+        dict: Attribute name -> value, empty if the config has no ``attrs``
+            section.
+
+    Raises:
+        ValueError: If a template refers to a field the config does not define.
+    """
+    fields = template_fields(settings)
+    attrs = {}
+    for name, value in (settings.get('attrs') or {}).items():
+        # numbers and booleans are legitimate attribute values with nothing to
+        # template, so only strings go through format_map
+        if not isinstance(value, str):
+            attrs[name] = value
+            continue
+        try:
+            attrs[name] = value.format_map(fields)
+        except KeyError as error:
+            raise ValueError(
+                f'attribute {name!r} refers to {error} which is not set '
+                f'in the config'
+            ) from None
+    return attrs
 
 
 def store_path(settings):

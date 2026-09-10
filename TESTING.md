@@ -274,7 +274,11 @@ written by different processes. Both are clean.
 2012 orphaned chunks is ~143 timesteps x 14 variables, which is exactly the two
 partial batches that were in flight when jobs 1 and 2 were killed. Their
 sessions never committed, so nothing references them. That is 0.8% of the store
-and was **not** cleaned up — see the reasoning under open questions.
+and was **not** cleaned up at the time.
+
+The 171 orphaned *snapshots* are a different story, and reading them as the
+commit history is what deferred the cleanup for a day. They were collected on
+2026-09-10 — finding 9.
 
 ## Full verification of the store (2026-09-10)
 
@@ -398,6 +402,112 @@ into one check, so 11 range checks that all passed were reported as failures by
 association. Worth remembering when reading any of these tables — one
 assertion, one property.
 
+## Finalization (2026-09-10)
+
+Turning the verified store into a deliverable: provenance attributes, an
+immutable tag, and the orphan cleanup this document had deferred. All of it ran
+on a login node for **free**, in about six minutes of wall time.
+
+| Step | Result |
+| --- | --- |
+| Global attributes | 7 -> 29, commit `N9M19WV4ZTGTPXBJA690` |
+| Tag | `v4.3a-verified-20260910` at that commit |
+| Garbage collection | 8.57 GiB, 2012 chunks, 513 manifests, 171 snapshots, 171 transaction logs |
+| Store on disk | 1,144,508,450,624 -> 1,135,311,017,909 bytes (**8.567 GiB freed**) |
+| Reachable | 1.0321 TiB across 171 snapshots, **unchanged either side of collection** |
+| Re-verification | 65 checks, 0 failures on `structure,sweep`; unreachable now 0.00 GiB |
+
+The store had only ever carried GLEAM's own seven attributes, so nothing in it
+recorded what produced it, from what, when, that it had been verified, or that
+`E` is absent on 25 days. It now carries 29, including a `chunking` note saying
+what the `time: 1` layout is and is not good for, and `known_data_gaps`. The
+coverage and grid attributes are derived from the data by `derive_attrs` rather
+than written by hand, so they cannot drift from what was actually stored; the
+rest come from a new `attrs` section in the config, so they are in git and
+reusable by the next rebuild.
+
+`Conventions` is **`ACDD-1.3`, not CF**. Claiming CF would have been false: the
+variables' `standard_name` values are descriptive upstream strings (`'Actual
+evaporation'`, not `water_evaporation_flux`) and the units are spelled
+`mm.day-1` and `m3.m-3`, which udunits does not parse. A `cf_compliance`
+attribute says so in the store rather than leaving a consumer to find out.
+
+### 9. The 171 orphaned snapshots are `fork` snapshots, one per commit
+
+The claim this document made — that collection "would also delete all 171
+snapshots and transaction logs — i.e. the entire commit history" — was wrong,
+and the counts on disk were enough to disprove it without running anything:
+
+| directory | before | after |
+| --- | --- | --- |
+| `chunks` | 237,553 | 235,541 |
+| `manifests` | 3,386 | 2,873 |
+| `snapshots` | 342 | **171** |
+| `transactions` | 342 | **171** |
+| `overwritten` | 342 | 343 |
+
+`snapshots/` held 342 objects while `ancestry(branch='main')` yielded 171, so
+342 = 171 reachable + 171 orphaned, and the 171 in the summary were the orphans.
+Collection took the directory down to exactly the reachable count. Nothing in
+live history was ever in the delete set: `garbage_collect` deletes an object
+only if no surviving snapshot references it, and `expire_snapshots` — the call
+that *would* collapse history — was never involved and is not needed to reclaim
+anything.
+
+What the orphans actually are is the more useful half. Looking one up gives the
+answer immediately: every one of the 171 has the commit message **`'fork'`**.
+`to_icechunk` forks the writable session for a dask-backed write, and the fork's
+snapshot is not part of the branch's ancestry, so **every batch leaves one
+unreachable snapshot behind as a matter of course** — 169 committed batches plus
+the two in flight when jobs 1 and 2 were killed at walltime is exactly 171. The
+same two killed batches account for the 2012 orphaned chunks. So the snapshot
+orphans are structural and the chunk orphans are the kill damage, which is why
+one number scaled with the run's length and the other did not.
+
+That was confirmed before touching the real store, on a synthetic repository
+small enough to run in seconds: three dask-backed batches produced 7 snapshot
+objects — 4 reachable, 3 forks — and a session abandoned without committing
+added one more snapshot and one orphaned chunk. Collection removed exactly those
+4 snapshots and 1 chunk, left `snapshots/` at the 4 reachable, and the data came
+back bit-identical. A first attempt at the same rehearsal wrote **numpy**-backed
+data and produced no forks at all, which is itself the proof that the fork is a
+property of the dask write path rather than of committing.
+
+**The lesson is about the measurement, not the store.** A `GCSummary` count read
+on its own is unfalsifiable — "171 snapshots" is equally consistent with
+"the whole history" and "171 objects nothing points at". It only becomes
+meaningful next to `len(ancestry(...))` and the object count on disk, and those
+two commands would have cost seconds. The missing comparison deferred a safe,
+free cleanup and put a wrong conclusion in this file.
+
+That is now a single command rather than a habit to remember:
+`finalize_gleam_zarr.py --status` prints the three numbers together — reachable
+history, objects on disk, and what is unreachable — and is step 1 of the
+documented procedure for exactly this reason.
+
+Two smaller things worth keeping:
+
+- **`overwritten/` is not self-cleaning.** It holds superseded copies of the
+  `repo` ref file, one per mutating operation, and collection *added* one rather
+  than removing any — it went 342 -> 343. It is 4.9 MB and nothing references
+  it, so it is cosmetic, but it does grow without bound across rebuilds.
+- **Collection is idempotent.** A second `--gc --apply` reports zeros, which is
+  the cheapest confirmation that the first one converged.
+
+### 10. Finalization belongs in its own script, not behind a verifier flag
+
+`--gc` was deliberately *not* added to `verify_gleam_zarr.py`. The verifier is
+what proves a finalization step did no harm, so a tool that both acted and
+audited would answer two questions with one exit status — and the read-only
+promise in its module docstring is the thing that makes it safe to run by
+reflex. `finalize_gleam_zarr.py` takes exactly one action per invocation and
+writes nothing without `--apply`.
+
+Its `--gc` brackets the collection with the two properties collection must not
+change, reachable bytes and history length, and exits non-zero if either moves.
+That check is the whole reason it was comfortable to run an irreversible
+operation on a store with no second copy — that, and the rehearsal above.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
@@ -411,24 +521,32 @@ assertion, one property.
   `to_icechunk(split_every=...)`). Deliberately skipped as unnecessary
   complexity once the queue choice made the run cheap. It is the thing to try
   if wallclock ever becomes the binding constraint.
-- **The 8.57 GiB of orphaned chunks was left in place.** `expire_snapshots` +
-  `garbage_collect` would reclaim it, but it is 0.8% of a 1.041 TiB store
-  against ~108 TiB of free scratch, and the dry run reports it would also
-  delete all 171 snapshots and transaction logs — i.e. the entire commit
-  history. That may be by design, since the intermediate per-batch snapshots
-  have little value once the store is verified, but it is not an irreversible
-  operation worth running on the only copy of a freshly built deliverable for a
-  0.8% saving. Revisit before archiving, or if repeated rebuilds accumulate
-  orphans (~4-5 GB per killed batch).
+- ~~**The 8.57 GiB of orphaned chunks was left in place.**~~ **Done
+  2026-09-10**, and the reasoning that deferred it was wrong. See finding 9.
 - **The store lives on scratch, which is purged.** 1.041 TiB sitting in
   `/glade/derecho/scratch` is subject to the purge policy; the campaign
-  allocation `/glade/campaign/univ/umic0112` has 5 TiB free and 0 used. Moving
-  or copying the finished store there matters considerably more than reclaiming
-  8.57 GiB.
+  allocation `/glade/campaign/univ/umic0112` has 5 TiB free and 0 used.
+  **Accepted, 2026-09-10**: the store stays on scratch for now and the move is
+  handled separately. `directories.raw` was added so a moved store can still be
+  verified against a raw tree that did not move with it, which is the coupling
+  the move runs into first. Until it moves, treat the store as reproducible
+  rather than archived.
 - **`chunks: {time: 1}` is the worst possible layout for point time-series
   reads**, which touch all 16802 chunks of a variable. Correct for the
   `spatial` store; if that access pattern matters downstream it wants a second,
-  time-chunked store rather than a change here.
+  time-chunked store rather than a change here. Now recorded in the store's own
+  `chunking` attribute, so a consumer does not have to discover it.
+- **The store is not CF compliant, and is not claimed to be.** Each variable's
+  `standard_name` and `units` come through unaltered from upstream, so the
+  standard names are descriptive strings and the units (`mm.day-1`, `m3.m-3`)
+  are not udunits-parseable. `Conventions` is `ACDD-1.3` and `cf_compliance`
+  states the gap. Fixing it means rewriting per-variable metadata and diverging
+  from what GLEAM published, which is a decision about what the store *is*
+  rather than a defect — worth taking deliberately if anything downstream runs
+  a CF checker.
+- **`overwritten/` grows without bound.** One superseded `repo` ref file per
+  mutating operation, 4.9 MB today, unreferenced and not collected. Cosmetic,
+  but it accumulates across rebuilds.
 
 ## Reproducing the tests
 
@@ -465,7 +583,18 @@ uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
 ```
 
 It exits non-zero if any check fails, and writes to
-`logs/verify_gleam_zarr.log` as well as stdout. `--seed` is worth varying
+`logs/verify_gleam_zarr.log` as well as stdout.
+
+Finalization is separate, and writes nothing without `--apply`:
+
+```bash
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
+```
+
+Run either without `--apply` first — the output is exactly what the applied run
+will do. After a `--gc --apply`, re-run the verifier's `structure,sweep` phases:
+they are the full-coverage check that nothing reachable was touched. `--seed` is worth varying
 between runs: the stratified draw is reproducible by default, which is
 convenient for comparing runs and useless for finding something new.
 

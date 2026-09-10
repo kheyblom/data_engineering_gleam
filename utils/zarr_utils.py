@@ -246,6 +246,44 @@ def build_encoding(dataset, chunks, batch_size):
     return encoding
 
 
+def derive_attrs(dataset):
+    """Global attributes that can only be read off the data itself.
+
+    Kept apart from the config's ``attrs`` so the coverage and grid figures
+    always describe what was actually written, rather than a number someone has
+    to remember to update. Callers merge the config on top, so any of these can
+    still be overridden by hand.
+
+    Args:
+        dataset (xarray.Dataset): The dataset being written or inspected.
+
+    Returns:
+        dict: ACDD coverage and geospatial attributes.
+    """
+    time = dataset['time'].values
+    lat = dataset['lat'].values
+    lon = dataset['lon'].values
+    # the grid is regular, so one step describes it; abs() because lat runs
+    # north to south and the resolution is not a signed quantity
+    lat_step = abs(float(lat[1] - lat[0]))
+    lon_step = abs(float(lon[1] - lon[0]))
+    # the coordinates are float32, so widening them to python floats exposes the
+    # representation error (89.94999999998977 for a cell centred on 89.95).
+    # Four decimals is finer than the 0.1 degree grid and coarser than the
+    # error, so it reports the grid the files describe rather than the float
+    return {
+        'time_coverage_start': str(time.min())[:10],
+        'time_coverage_end': str(time.max())[:10],
+        'time_coverage_resolution': 'P1D',
+        'geospatial_lat_min': round(float(lat.min()), 4),
+        'geospatial_lat_max': round(float(lat.max()), 4),
+        'geospatial_lon_min': round(float(lon.min()), 4),
+        'geospatial_lon_max': round(float(lon.max()), 4),
+        'geospatial_lat_resolution': round(lat_step, 4),
+        'geospatial_lon_resolution': round(lon_step, 4),
+    }
+
+
 def open_repository(path):
     """Open the icechunk repository at a path, creating it if it is not there.
 
@@ -257,6 +295,27 @@ def open_repository(path):
     """
     storage = icechunk.local_filesystem_storage(path)
     return icechunk.Repository.open_or_create(storage)
+
+
+def open_existing_repository(path):
+    """Open an icechunk repository that must already exist.
+
+    ``open_repository`` creates one if it is absent, which is right for the
+    build and wrong for anything administrative: a mistyped path would create an
+    empty repository beside the real store, and every subsequent report --
+    a garbage collection that freed nothing, a store that verified clean --
+    would be true of that empty repository rather than of the store.
+
+    Args:
+        path (str): Directory holding the store.
+
+    Returns:
+        icechunk.Repository: The opened repository.
+
+    Raises:
+        Exception: If there is no repository at the path.
+    """
+    return icechunk.Repository.open(icechunk.local_filesystem_storage(path))
 
 
 def committed_timesteps(repository):

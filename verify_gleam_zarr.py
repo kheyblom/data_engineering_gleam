@@ -734,11 +734,19 @@ def check_repository(report, repository, dataset, settings):
     batch = settings.get('timesteps_per_commit', DEFAULT_TIMESTEPS_PER_COMMIT)
     # one commit per batch, plus the repository's own initial snapshot
     expected = -(-dataset.sizes['time'] // batch) + 1
+    # a finalization commit -- provenance attributes, for instance -- legitimately
+    # adds to this, so the build's batch count is a floor rather than an equality
     report.check(
-        'one reachable snapshot per commit batch, plus the initial one',
-        len(snapshots) == expected,
-        f'{len(snapshots)} of {expected}',
+        'at least one reachable snapshot per commit batch, plus the initial one',
+        len(snapshots) >= expected,
+        f'{len(snapshots)} of {expected} expected from the build',
     )
+    # ancestry yields newest first, so any surplus is the head of the list
+    if len(snapshots) > expected:
+        messages = [s.message for s in snapshots[: len(snapshots) - expected]]
+        report.note(
+            f'{len(snapshots) - expected} snapshot(s) beyond the build: {messages}'
+        )
 
     summary = repository.garbage_collect(
         datetime.datetime.now(datetime.timezone.utc), dry_run=True
