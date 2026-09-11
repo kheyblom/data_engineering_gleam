@@ -1,20 +1,35 @@
 """Helpers for building icechunk backed zarr stores from netCDF inputs.
 
-The stores are written incrementally: the dataset is assembled lazily with dask,
-then pushed out in batches of timesteps, each batch committed to the icechunk
-repository before the next one starts. That makes a run restartable, which
-matters when a store is large enough that a single write will not fit in one
-job's walltime. A batch is streamed chunk by chunk rather than held whole, so
-peak memory follows the chunks in flight, which ``configure_runtime`` bounds.
+Either way a store is written, it is written in pieces, each committed to the
+icechunk repository before the next one starts. That is what makes a run
+restartable, which matters when a store is large enough that a single write will
+not fit in one job's walltime. Which piece is the unit depends on how the store
+is chunked, and ``write_strategy`` in the config picks between the two:
 
-Batch boundaries are always a whole number of time chunks. Appending onto a
-partially filled chunk would mean rewriting it, which xarray refuses to do from
-dask, so only the final batch is allowed to be short.
+``append`` is for a store chunked shallowly along time, where a timestep is
+cheap to write and the whole spatial grid is not. The dataset is assembled
+lazily and pushed out in batches of timesteps, each appended to the last. A
+batch is streamed chunk by chunk rather than held whole, so peak memory follows
+the chunks in flight, which ``configure_runtime`` bounds. Batch boundaries are
+always a whole number of time chunks: appending onto a partially filled chunk
+would mean rewriting it, which xarray refuses to do from dask, so only the final
+batch is allowed to be short.
+
+``region`` is for a store chunked along the whole time axis, where appending is
+impossible -- every chunk spans every timestep, so there is no boundary to
+append at and a batched write collapses into one uninterruptible commit. Instead
+the store's metadata and coordinates are laid down first as a skeleton, and the
+arrays are then filled in place, one lat/lon block at a time across the full
+record. A block is read whole into memory rather than streamed, so peak memory
+is the block, and the block is deliberately much larger than an output chunk:
+the raw files are chunked coarsely in space, so a small block re-reads and
+re-decompresses the same source chunk for every tile it overlaps.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 
 import dask
 from dask.system import CPU_COUNT
@@ -39,6 +54,23 @@ DEFAULT_CHUNK_CACHE_SLOTS = 2003
 
 # branch every commit is written to
 BRANCH = 'main'
+
+# how a store is filled. 'append' extends the time axis batch by batch; 'region'
+# lays down a skeleton and fills it block by block. See the module docstring.
+DEFAULT_WRITE_STRATEGY = 'append'
+WRITE_STRATEGIES = ('append', 'region')
+
+# the region path's resume state lives in the commit messages rather than in the
+# store, so that reading it back needs nothing but the history icechunk already
+# keeps, and so finalize_gleam_zarr.py does not have to strip build bookkeeping
+# out of the attributes it publishes. The pair has to stay in step.
+SKELETON_MESSAGE = 'create skeleton'
+BLOCK_MESSAGE = 'write {variable} lat[{lat0}:{lat1}) lon[{lon0}:{lon1})'
+BLOCK_MESSAGE_RE = re.compile(
+    r'^write (?P<variable>\S+) '
+    r'lat\[(?P<lat0>\d+):(?P<lat1>\d+)\) '
+    r'lon\[(?P<lon0>\d+):(?P<lon1>\d+)\)$'
+)
 
 
 def configure_runtime(settings):
@@ -199,7 +231,7 @@ def merge_variables(datasets):
     )
 
 
-def build_encoding(dataset, chunks, batch_size):
+def build_encoding(dataset, chunks, time_coord_chunk):
     """Build zarr encoding for every variable, replacing the netCDF encoding.
 
     The encoding xarray carries over from the netCDF files describes HDF5
@@ -209,8 +241,10 @@ def build_encoding(dataset, chunks, batch_size):
     Args:
         dataset (xarray.Dataset): The dataset about to be written.
         chunks (dict): Resolved chunk sizes.
-        batch_size (int): Timesteps per commit; the time coordinate is chunked
-            this way so that each append lands on a chunk boundary.
+        time_coord_chunk (int): Chunk length for the time coordinate. The append
+            path passes the commit batch size, so that each append lands on a
+            chunk boundary; the region path has no batches and passes the whole
+            axis.
 
     Returns:
         dict: Encoding to hand to the zarr writer.
@@ -225,10 +259,16 @@ def build_encoding(dataset, chunks, batch_size):
         )
         encoding[name] = {'chunks': shape}
 
+        # an index coordinate is a label rather than a field: anything that opens
+        # the store reads it whole, and it is small enough that splitting it buys
+        # nothing. Without this it inherits the chunking of the data it indexes,
+        # which at chunks.lat = 20 would give the 1800 long lat coordinate 90
+        # chunks. Harmless at chunks.lat = -1, which is why it went unnoticed.
+        if variable.ndim == 1 and variable.dims[0] == name:
+            encoding[name]['chunks'] = (variable.sizes[name],)
+
         if name == 'time':
-            # one chunk per commit, so appending a batch never has to rewrite a
-            # partially filled chunk of the time coordinate
-            encoding[name]['chunks'] = (batch_size,)
+            encoding[name]['chunks'] = (time_coord_chunk,)
             # pin the calendar so every appended batch is encoded identically
             encoding[name]['units'] = 'days since 1900-01-01'
             encoding[name]['calendar'] = 'proleptic_gregorian'
@@ -406,3 +446,341 @@ def write_dataset(repository, dataset, encoding, batch_size, start=0):
         LOG.info(f'committed timesteps {begin}-{end - 1} as {snapshot}')
         n_batches += 1
     return n_batches
+
+
+def resolve_write_strategy(settings, chunks, sizes):
+    """Pick the write strategy and check it suits the configured chunking.
+
+    The two strategies are not interchangeable, and getting the pairing wrong
+    fails quietly rather than loudly, which is why it is checked here. An
+    ``append`` build of a store whose time chunk spans the whole record
+    degenerates to a single batch: ``commit_batch_size`` rounds the target up to
+    one whole chunk, ``write_dataset`` runs one iteration, and the run becomes
+    one uninterruptible commit that a walltime kill loses entirely. A ``region``
+    build of a shallowly chunked store is merely wasteful, reading the whole
+    record into memory to write chunks one timestep deep.
+
+    Args:
+        settings (dict): The loaded configuration.
+        chunks (dict): Resolved chunk sizes.
+        sizes (Mapping): Length of each dimension, e.g. ``dataset.sizes``.
+
+    Returns:
+        str: The strategy to use, one of ``WRITE_STRATEGIES``.
+
+    Raises:
+        ValueError: If the strategy is unknown, or does not match the chunking.
+    """
+    strategy = settings.get('write_strategy', DEFAULT_WRITE_STRATEGY)
+    if strategy not in WRITE_STRATEGIES:
+        raise ValueError(
+            f'unknown write_strategy {strategy!r}; expected one of '
+            f'{list(WRITE_STRATEGIES)}'
+        )
+
+    whole_axis = chunks['time'] >= sizes['time']
+    if strategy == 'append' and whole_axis:
+        raise ValueError(
+            f"write_strategy 'append' needs a time chunk shorter than the "
+            f'record, but chunks.time resolves to {chunks["time"]} against '
+            f'{sizes["time"]} timesteps; the whole build would be one commit '
+            f"with no resume. Use write_strategy 'region'"
+        )
+    if strategy == 'region' and not whole_axis:
+        raise ValueError(
+            f"write_strategy 'region' fills whole time chunks in place, but "
+            f'chunks.time resolves to {chunks["time"]} against '
+            f'{sizes["time"]} timesteps; set chunks.time to -1 or use '
+            f"write_strategy 'append'"
+        )
+    return strategy
+
+
+def block_read_chunks(settings):
+    """Chunks to open the raw files with on the region path.
+
+    The store's own chunking is the wrong thing to read with here. Opening
+    644 files as 20x20 tiles would build roughly ten million dask chunks before
+    a single byte is read, and each tile would decompress the 57x113 source
+    chunk it sits inside. The block is the read unit instead, so one source
+    chunk is decompressed once for all the tiles it covers.
+
+    Args:
+        settings (dict): The loaded configuration.
+
+    Returns:
+        dict: Chunk sizes for ``open_mfdataset``, whole along time because a
+            block spans the record and ``open_mfdataset`` chunks per file.
+    """
+    block_shape = settings.get('block_shape') or {}
+    return {
+        'time': -1,
+        'lat': block_shape.get('lat', -1),
+        'lon': block_shape.get('lon', -1),
+    }
+
+
+def resolve_block_shape(settings, chunks, sizes):
+    """Resolve the lat/lon block the region path reads and commits in.
+
+    Args:
+        settings (dict): The loaded configuration; ``block_shape`` may set
+            either dimension, and -1 or an absent key means the whole one.
+        chunks (dict): Resolved chunk sizes.
+        sizes (Mapping): Length of each dimension, e.g. ``dataset.sizes``.
+
+    Returns:
+        dict: Block length per spatial dimension.
+
+    Raises:
+        ValueError: If a block is not a whole number of output chunks.
+    """
+    block_shape = settings.get('block_shape') or {}
+    resolved = {}
+    for dimension in ('lat', 'lon'):
+        size = block_shape.get(dimension, -1)
+        size = sizes[dimension] if size == -1 else size
+        # a region write addresses the store's chunk grid directly, so a block
+        # that is not a whole number of chunks would land mid chunk and force
+        # zarr to read, patch and rewrite chunks the next block also touches
+        if size % chunks[dimension]:
+            raise ValueError(
+                f'block_shape.{dimension} of {size} is not a whole number of '
+                f'{chunks[dimension]} cell chunks'
+            )
+        resolved[dimension] = min(size, sizes[dimension])
+    return resolved
+
+
+def iter_blocks(variables, sizes, block_shape):
+    """Every block of the region build, in the order it should be written.
+
+    Variable major, so one variable's files stay open across all its blocks
+    rather than being reopened once per block.
+
+    Args:
+        variables (list): Variable names to write.
+        sizes (Mapping): Length of each dimension, e.g. ``dataset.sizes``.
+        block_shape (dict): Resolved block length per spatial dimension.
+
+    Returns:
+        list: ``(variable, lat0, lat1, lon0, lon1)`` tuples, each of which is
+            both the unit of work and its own resume key.
+    """
+    blocks = []
+    for variable in variables:
+        for lat0 in range(0, sizes['lat'], block_shape['lat']):
+            lat1 = min(lat0 + block_shape['lat'], sizes['lat'])
+            for lon0 in range(0, sizes['lon'], block_shape['lon']):
+                lon1 = min(lon0 + block_shape['lon'], sizes['lon'])
+                blocks.append((variable, lat0, lat1, lon0, lon1))
+    return blocks
+
+
+def block_message(block):
+    """Render a block as the commit message that records it.
+
+    Args:
+        block (tuple): ``(variable, lat0, lat1, lon0, lon1)``.
+
+    Returns:
+        str: The commit message ``committed_blocks`` parses back.
+    """
+    variable, lat0, lat1, lon0, lon1 = block
+    return BLOCK_MESSAGE.format(
+        variable=variable, lat0=lat0, lat1=lat1, lon0=lon0, lon1=lon1
+    )
+
+
+def create_skeleton(repository, dataset, encoding):
+    """Lay down the store's metadata and coordinates, with no data chunks.
+
+    ``compute=False`` writes the group, every array's metadata and every
+    variable already in memory, and defers only the dask backed ones -- which
+    here is all of the data. The result is a store of the right shape and
+    chunking that ``write_by_region`` can then fill in place.
+
+    Args:
+        repository (icechunk.Repository): The repository to write into.
+        dataset (xarray.Dataset): The lazy dataset whose shape to lay down.
+        encoding (dict): Encoding for the arrays being created.
+
+    Returns:
+        str: The snapshot id of the commit.
+    """
+    # a dask backed coordinate would have its array created and left empty,
+    # since compute=False defers exactly the writes that are not yet in memory
+    dataset = dataset.assign_coords(
+        {name: coordinate.load() for name, coordinate in dataset.coords.items()}
+    )
+
+    # open_mfdataset leaves one dask chunk per file along time, so a store chunk
+    # spanning the whole record would straddle several of them and xarray
+    # refuses the write rather than risk two dask tasks writing one chunk. No
+    # data is written here, but the check runs anyway, so present the time axis
+    # as the single chunk the region strategy requires it to be. This is a
+    # graph operation on a lazy dataset and reads nothing.
+    dataset = dataset.chunk({'time': -1})
+
+    session = repository.writable_session(branch=BRANCH)
+    dataset.to_zarr(
+        session.store,
+        mode='w',
+        encoding=encoding,
+        consolidated=False,
+        zarr_format=3,
+        compute=False,
+    )
+    snapshot = session.commit(SKELETON_MESSAGE)
+    LOG.info(f'created skeleton as {snapshot}')
+    return snapshot
+
+
+def store_variables(repository):
+    """Data variables already present in the store.
+
+    Args:
+        repository (icechunk.Repository): The repository to inspect.
+
+    Returns:
+        set: The store's data variable names, empty if nothing is written yet.
+    """
+    session = repository.readonly_session(branch=BRANCH)
+    try:
+        stored = xr.open_zarr(session.store, consolidated=False)
+    except Exception:
+        # a freshly created repository has an empty root group and no arrays
+        return set()
+    return set(stored.data_vars)
+
+
+def committed_blocks(repository):
+    """The blocks a previous run already wrote, read back from the history.
+
+    Progress lives in the commit messages rather than in the store so that
+    resuming needs nothing but the history icechunk keeps anyway, and so that
+    ``finalize_gleam_zarr.py`` does not have to strip build bookkeeping out of
+    the attributes it publishes.
+
+    Args:
+        repository (icechunk.Repository): The repository to inspect.
+
+    Returns:
+        set: ``(variable, lat0, lat1, lon0, lon1)`` tuples already written.
+    """
+    blocks = set()
+    for snapshot in repository.ancestry(branch=BRANCH):
+        match = BLOCK_MESSAGE_RE.match(snapshot.message)
+        if match is None:
+            continue
+        blocks.add(
+            (
+                match['variable'],
+                int(match['lat0']),
+                int(match['lat1']),
+                int(match['lon0']),
+                int(match['lon1']),
+            )
+        )
+    return blocks
+
+
+def check_resume_region(repository, dataset, chunks):
+    """Check a partially filled store matches the dataset being written.
+
+    The region path never appends, so a mismatch would not fail at the write:
+    it would quietly overwrite part of one store with data belonging to
+    another. This is the guard ``check_resume`` is for the append path.
+
+    Args:
+        repository (icechunk.Repository): The repository holding the store.
+        dataset (xarray.Dataset): The dataset about to be written.
+        chunks (dict): Resolved chunk sizes.
+
+    Raises:
+        ValueError: If the store's variables, coordinates or chunk grid do not
+            match.
+    """
+    session = repository.readonly_session(branch=BRANCH)
+    stored = xr.open_zarr(session.store, consolidated=False)
+
+    expected = set(dataset.data_vars)
+    found = set(stored.data_vars)
+    if found != expected:
+        raise ValueError(
+            f'store already holds variables {sorted(found)} but this run would '
+            f'write {sorted(expected)}; delete the store to rebuild it'
+        )
+
+    # the whole axis, not an overlap: a region build creates every coordinate up
+    # front, so anything short of equality is a different dataset
+    for name in ('time', 'lat', 'lon'):
+        if not stored[name].equals(dataset[name]):
+            raise ValueError(
+                f'the {name} coordinate in the store does not match the input '
+                f'files; delete the store to rebuild it'
+            )
+
+    for name in sorted(expected):
+        shape = tuple(chunks[dimension] for dimension in stored[name].dims)
+        if tuple(stored[name].encoding['chunks']) != shape:
+            raise ValueError(
+                f'{name} in the store is chunked '
+                f'{tuple(stored[name].encoding["chunks"])} but this run would '
+                f'write {shape}; delete the store to rebuild it'
+            )
+
+
+def write_by_region(repository, dataset, blocks, done=frozenset()):
+    """Fill a skeleton store block by block, committing each one.
+
+    Each block is one variable's full time record over a lat/lon tile. It is
+    read into memory whole -- the point of the strategy is that the source
+    chunks underneath it are decompressed once rather than once per output
+    chunk -- so peak memory here is the block, not the chunks in flight.
+
+    Args:
+        repository (icechunk.Repository): The repository to write into.
+        dataset (xarray.Dataset): The lazy dataset to read blocks from.
+        blocks (list): Every block of the build, from ``iter_blocks``.
+        done (Container): Blocks a previous run already committed.
+
+    Returns:
+        int: The number of blocks written by this call.
+    """
+    n_time = dataset.sizes['time']
+    remaining = [block for block in blocks if block not in done]
+    if not remaining:
+        LOG.info('store is already complete, nothing to write')
+        return 0
+    LOG.info(f'{len(remaining)} blocks to write of {len(blocks)}')
+
+    n_written = 0
+    for position, block in enumerate(remaining, start=1):
+        variable, lat0, lat1, lon0, lon1 = block
+        message = block_message(block)
+        region = {
+            'time': slice(0, n_time),
+            'lat': slice(lat0, lat1),
+            'lon': slice(lon0, lon1),
+        }
+
+        data = dataset[[variable]].isel(lat=region['lat'], lon=region['lon'])
+        LOG.info(
+            f'block {position}/{len(remaining)}: reading {message} '
+            f'({data.nbytes / 1024**3:.1f} GiB)'
+        )
+        data = data.load()
+
+        # a region write addresses arrays that already exist, so the index
+        # coordinates naming the region are not part of what is written
+        data = data.drop_vars(
+            [name for name in ('time', 'lat', 'lon') if name in data.variables]
+        )
+
+        session = repository.writable_session(branch=BRANCH)
+        to_icechunk(data, session, region=region)
+        snapshot = session.commit(message)
+        LOG.info(f'committed {message} as {snapshot}')
+        n_written += 1
+    return n_written
