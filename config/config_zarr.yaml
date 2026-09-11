@@ -39,11 +39,12 @@ block_shape:
 num_workers: 2
 # a block reads every file of one variable, not two year files per variable
 file_cache_maxsize: 64
-# each block is one contiguous hyperslab per file, so every source chunk is
-# decompressed once and this cache is no longer the 7.6x lever it is for the
-# spatial build. Left at 512 until the bench tier measures what it is worth
-# here; it costs file_cache_maxsize x this much memory in the worst case.
-chunk_cache_size_mib: 512
+# 64 rather than the append path's 512. A block is one contiguous hyperslab per
+# file, so every source chunk it touches is decompressed once regardless and the
+# cache is not doing the job it does there. What it does do is multiply: at 46
+# files open it was holding 23.6 GB, which is most of the way to a job's memory
+# cap on its own. Costs file_cache_maxsize x this much memory in the worst case.
+chunk_cache_size_mib: 64
 
 # Store global attributes. Every string is templated over the same config fields
 # the filename template uses, so {version_label} and friends stay in one place.

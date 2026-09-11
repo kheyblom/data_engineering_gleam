@@ -731,13 +731,46 @@ def check_resume_region(repository, dataset, chunks):
             )
 
 
+def read_into_buffer(array):
+    """Read a lazy array into one preallocated buffer, a time chunk at a time.
+
+    ``.load()`` would be the obvious thing here and it is the wrong one at this
+    size. Dask assembles a block by holding every input chunk and allocating the
+    concatenated output alongside them, so the block is transiently **doubled**
+    at the moment it comes together -- 45 GiB becomes 90 GiB with no warning.
+    Against a job's memory cgroup that does not fail cleanly: the kernel spends
+    itself on page reclaim (measured 46 minutes of system time against 2 of
+    user) and the allocation eventually fails inside HDF5, which reports it as
+    the uninformative ``NetCDF: HDF error``.
+
+    Filling a buffer instead makes peak memory the block plus one time chunk,
+    and the chunk boundaries are the file boundaries, so each read is still one
+    contiguous hyperslab out of one file.
+
+    Args:
+        array (xarray.DataArray): The lazy, dask backed block to read.
+
+    Returns:
+        numpy.ndarray: The block's values, CF decoded.
+    """
+    values = np.empty(array.shape, dtype=array.dtype)
+    begin = 0
+    for step in array.chunks[array.dims.index('time')]:
+        values[begin:begin + step] = array.isel(
+            time=slice(begin, begin + step)
+        ).values
+        begin += step
+    return values
+
+
 def write_by_region(repository, dataset, blocks, done=frozenset()):
     """Fill a skeleton store block by block, committing each one.
 
     Each block is one variable's full time record over a lat/lon tile. It is
     read into memory whole -- the point of the strategy is that the source
     chunks underneath it are decompressed once rather than once per output
-    chunk -- so peak memory here is the block, not the chunks in flight.
+    chunk -- so peak memory here is the block, not the chunks in flight. See
+    ``read_into_buffer`` for why it is not read with ``.load()``.
 
     Args:
         repository (icechunk.Repository): The repository to write into.
@@ -765,18 +798,16 @@ def write_by_region(repository, dataset, blocks, done=frozenset()):
             'lon': slice(lon0, lon1),
         }
 
-        data = dataset[[variable]].isel(lat=region['lat'], lon=region['lon'])
+        array = dataset[variable].isel(lat=region['lat'], lon=region['lon'])
         LOG.info(
             f'block {position}/{len(remaining)}: reading {message} '
-            f'({data.nbytes / 1024**3:.1f} GiB)'
+            f'({array.nbytes / 1024**3:.1f} GiB)'
         )
-        data = data.load()
+        values = read_into_buffer(array)
 
         # a region write addresses arrays that already exist, so the index
         # coordinates naming the region are not part of what is written
-        data = data.drop_vars(
-            [name for name in ('time', 'lat', 'lon') if name in data.variables]
-        )
+        data = xr.Dataset({variable: (array.dims, values, dict(array.attrs))})
 
         session = repository.writable_session(branch=BRANCH)
         to_icechunk(data, session, region=region)
