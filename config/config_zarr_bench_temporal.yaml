@@ -1,0 +1,35 @@
+# Tier 2 timing config for the region write strategy. Shrinks nothing about the
+# data except the variable list: the real raw tree, the full 46 year record, the
+# production chunking and the production block. One dense variable is 1/14 of
+# the production build, which fits inside a single develop job and measures the
+# three numbers the production chain has to be sized from -- throughput, peak
+# memory, and what the layout actually compresses to.
+#
+# Ep because it is one of the densest variables (127 GB raw, and every written
+# chunk in the spatial store is 7.4-7.7 MiB), so it is the honest case rather
+# than the flattering one. Its counterpart in the spatial store is 123.8 GiB
+# compressed, which is what the size measured here should be read against.
+#
+# Delete the store after Tier 2.
+directories:
+  download: /glade/derecho/scratch/kheyblom/data/gleam/
+  logs: ./logs
+output_conventions:
+  filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
+  suffix: bench_temporal
+log_file: gleam_zarr_bench_temporal.log
+version: v4.3a
+variables: [Ep]
+temporal_resolution: daily
+grid_name: native_0p1x0p1
+chunks:
+  time: -1
+  lat: 20
+  lon: 20
+write_strategy: region
+block_shape:
+  lat: 200
+  lon: -1
+num_workers: 2
+file_cache_maxsize: 64
+chunk_cache_size_mib: 512

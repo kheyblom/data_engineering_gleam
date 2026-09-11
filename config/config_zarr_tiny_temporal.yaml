@@ -1,0 +1,54 @@
+# Tier 1 correctness config for the region write strategy: a staged tree of
+# symlinks holding two variables for two years, so a full build, a resume, and a
+# rerun all finish in minutes. Two years rather than one because the region path
+# reads a block across every file at once, so a single file would not exercise
+# the concatenation the strategy exists to do. Every path key differs from the
+# production config, so this can never touch a real store. The tree is symlinks
+# into the real raw data and is rebuilt on demand, so it is staged from a
+# throwaway script rather than one kept in the repo:
+#
+#   SRC=/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/raw/daily
+#   DST=/glade/derecho/scratch/$USER/data/gleam_tiny/v_4_3_a/raw/daily
+#   for v in E Ec; do mkdir -p "$DST/$v"; for y in 1980 1981; do
+#     ln -sf "$SRC/$v/${v}_${y}_GLEAM_v4.3a.nc" "$DST/$v/${v}_${y}_GLEAM_v4.3a.nc"
+#   done; done
+directories:
+  download: /glade/derecho/scratch/kheyblom/data/gleam_tiny/
+  logs: ./logs
+output_conventions:
+  filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
+  # not 'temporal': the staged tree already isolates this store by directory,
+  # but a distinct name means a mistyped path cannot quietly resolve to a real
+  # store
+  suffix: tiny_temporal
+log_file: gleam_zarr_tiny_temporal.log
+version: v4.3a
+# 'all' expands against what is on disk, which in the staged tree is E and Ec
+variables: all
+temporal_resolution: daily
+grid_name: native_0p1x0p1
+chunks:
+  time: -1
+  lat: 20
+  lon: 20
+write_strategy: region
+# lon is spanned whole, as it must be: a block narrower than the globe reads a
+# strided subset of the source chunks rather than contiguous runs, which is slow
+# out of all proportion to its volume. 3 lat bands per variable, 6 blocks in all,
+# so there is something to resume from partway through and the variable-major
+# ordering is actually exercised
+block_shape:
+  lat: 600
+  lon: -1
+num_workers: 2
+file_cache_maxsize: 64
+chunk_cache_size_mib: 512
+
+# a minimal attrs section, so a tiny run exercises the same attribute path the
+# production build and finalize_gleam_zarr.py use rather than skipping it
+attrs:
+  title: 'TEST STORE -- GLEAM {version_label} {temporal_resolution}, staged subset, not for use'
+  Conventions: ACDD-1.3
+  comment: >-
+    Built from config_zarr_tiny_temporal.yaml against a staged tree of two
+    variables for two years. A correctness fixture, not data.

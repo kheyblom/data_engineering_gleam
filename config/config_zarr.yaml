@@ -3,23 +3,46 @@ directories:
   logs: ./logs
 output_conventions:
   filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
-  suffix: spatial
-log_file: gleam_zarr.log
+  # sibling of the 'spatial' store built from the same files: same data, same
+  # grid, chunked for the opposite access pattern
+  suffix: temporal
+# not shared with the spatial build, so one store's forensics stay readable
+log_file: gleam_zarr_temporal.log
 version: v4.3a
 variables: all
 temporal_resolution: daily
 grid_name: native_0p1x0p1
+# one chunk holds a 2 x 2 degree tile through the whole 46 year record, 25.6 MiB
+# of float32. A point time series is one chunk; a global map is 16200 of them
 chunks:
-  time: 1
-  lat: -1
+  time: -1
+  lat: 20
+  lon: 20
+# a store chunked across the whole time axis has no append boundary to stop at,
+# so it is written as a skeleton and filled in place, one block per commit
+write_strategy: region
+# the read and commit unit. Two things decide it, and locality matters more
+# than volume. It has to be much wider than a chunk, because the raw files are
+# chunked [12, 57, 113] and a block only 20 cells wide would decompress each
+# 57 x 113 source chunk once per tile it covers. And it has to span lon
+# *entirely*: a block narrower than the globe reads a strided subset of the
+# source chunks -- 11 of every 32 along lon, scattered through the file -- which
+# measured pathologically slow on dense variables even though the volume was the
+# same. Full lon turns every read into contiguous runs of 32 source chunks.
+# At lat: 200 that is 45.1 GiB resident per block against 1.43x read
+# amplification, a trade worth making because Derecho bills cpus, not memory.
+block_shape:
+  lat: 200
   lon: -1
-timesteps_per_commit: 100
-num_workers: 4
-file_cache_maxsize: 32
-# the raw files are chunked 12 timesteps deep while the store is written one
-# timestep at a time, so this has to hold a whole 12 deep row of chunks (302 MiB)
-# or HDF5 decompresses each one twelve times over; measured 7.6x end to end.
-# Costs file_cache_maxsize x this much memory in the worst case.
+# the build is ~1 core whatever this says: xarray serialises every netCDF read
+# behind one process global HDF5 lock. Sized to the job, not to the work
+num_workers: 2
+# a block reads every file of one variable, not two year files per variable
+file_cache_maxsize: 64
+# each block is one contiguous hyperslab per file, so every source chunk is
+# decompressed once and this cache is no longer the 7.6x lever it is for the
+# spatial build. Left at 512 until the bench tier measures what it is worth
+# here; it costs file_cache_maxsize x this much memory in the worst case.
 chunk_cache_size_mib: 512
 
 # Store global attributes. Every string is templated over the same config fields
@@ -29,7 +52,7 @@ chunk_cache_size_mib: 512
 attrs:
   title: >-
     GLEAM {version_label} daily land evaporation and soil moisture,
-    native 0.1 degree global grid, 1980-2025
+    native 0.1 degree global grid, 1980-2025, chunked for time series
   summary: >-
     All 14 GLEAM {version_label} daily variables merged onto one time/lat/lon
     grid and stored as a single icechunk-backed zarr store: actual (E),
@@ -51,31 +74,38 @@ attrs:
     GLEAM {version_label} daily netCDF files, 644 files covering 14 variables
     x 46 years, one file per variable-year
   history: >-
-    2026-09-09/2026-09-10: converted from the GLEAM netCDF files to this
-    icechunk-backed zarr store by gleam_zarr.py (data_engineering_gleam @
-    74a3eaa) in 169 append commits; 2026-09-10: global attributes added by
-    finalize_gleam_zarr.py
-  date_created: '2026-09-10T10:24:11Z'
+    2026-09-11: written from the GLEAM {version_label} daily netCDF files by
+    gleam_zarr.py (data_engineering_gleam), as a skeleton plus one commit per
+    lat/lon block. Built from the same source files as the sibling
+    gleam.{version}.{temporal_resolution}.{grid_name}.spatial.zarr, not derived
+    from it, so the two are independently verified against raw.
+  date_created: '2026-09-11'
   creator_name: Kyle Heyblom
   creator_email: heyblom@umich.edu
   references: >-
     https://www.gleam.eu/ -- the dataset citations are in the Reference1 and
     Reference2 attributes carried over from the source files
   chunking: >-
-    Chunked (time, lat, lon) = (1, 1800, 3600), float32, zstd: one whole global
-    map per chunk, 24.7 MiB. Built for reading maps and fields. A point time
-    series is the worst case for this layout, touching all 16802 chunks of a
-    variable; if that access pattern matters, build a second store chunked
-    along time rather than reading this one that way.
+    Chunked (time, lat, lon) = (16802, 20, 20), float32, zstd: one 2 x 2 degree
+    tile through the whole 46 year record per chunk, 25.6 MiB. Built for reading
+    time series -- a series at any point is a single chunk. A global map is the
+    worst case for this layout, touching all 16200 chunks of a variable; for
+    maps and fields read the sibling
+    gleam.{version}.{temporal_resolution}.{grid_name}.spatial.zarr instead,
+    which holds the same data chunked (1, 1800, 3600).
+  related_store: >-
+    gleam.{version}.{temporal_resolution}.{grid_name}.spatial.zarr -- the same
+    14 variables on the same grid over the same period, chunked one whole global
+    map per chunk. Identical values; the two differ only in chunking.
   known_data_gaps: >-
     Variable E is entirely fill (NaN) on 25 days -- five 5-day blocks,
     1982-02-05..02-09 and 1992-01-01..01-05, 03-21..03-25, 05-20..05-24 and
     10-02..10-06 -- while every other variable, including E's own components,
     has data on those days. This is a gap in upstream GLEAM {version_label},
-    not a conversion defect. Zarr does not write a chunk whose cells are all
-    fill, so E holds 16777 chunks against 16802 timesteps and that is correct.
-  verification: >-
-    Verified 2026-09-10 against the source netCDF files by verify_gleam_zarr.py:
-    103 checks, 0 failures across structure, index, samples, sweep (all 235228
-    chunks), component identities and physical ranges. Value comparisons are
-    bit-exact, not approximate.
+    not a conversion defect. Under this chunking those days fall inside chunks
+    that also hold valid days, so unlike in the spatial store they leave no
+    missing chunks; the chunks that are absent here are the tiles that are NaN
+    across the entire record, which is ocean.
+  # 'verification' is deliberately absent until the verifier has actually run
+  # against this store: it is added by finalize_gleam_zarr.py --attrs, which is
+  # gated on that. A store must not carry a claim that has not been earned.
