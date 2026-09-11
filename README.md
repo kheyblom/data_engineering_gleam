@@ -9,10 +9,17 @@ paths, version, variables, chunk sizes, and the execution settings all come from
 the config, so a different store is a different config file rather than a code
 change.
 
-The write is **incremental and restartable** — timesteps are pushed out in
-batches, each committed to the icechunk repository before the next starts. A run
-killed by walltime leaves a valid store committed up to its last batch, and
-relaunching with the same config picks up from there.
+The write is **incremental and restartable**: the store goes out in pieces, each
+committed to the icechunk repository before the next starts, so a run killed by
+walltime leaves a valid store and relaunching with the same config picks up from
+there. What a piece is follows the chunking, and `write_strategy` picks between
+the two — `append` writes a batch of timesteps at a time, `region` writes one
+lat/lon block of the whole record at a time. See
+[How the build works](#how-the-build-works).
+
+Two stores are built from the same source files, differing only in chunking:
+`spatial` for reading maps, `temporal` for reading time series. Neither is
+derived from the other, so each is verified against the raw files on its own.
 
 ## Layout
 
@@ -31,7 +38,12 @@ that resolves to:
 ```
 /glade/derecho/scratch/$USER/data/gleam/v_4_3_a/raw/daily/<variable>/*.nc
 /glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr
+/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.temporal.zarr
 ```
+
+The `suffix` field is the only difference between those two names, and the only
+difference between the configs that build them is `chunks`, `write_strategy` and
+the block size.
 
 Repository files:
 
@@ -43,7 +55,7 @@ Repository files:
 | [config/config_zarr.yaml](config/config_zarr.yaml) | The config that drives it |
 | [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
-| [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, batched writes, resume checks |
+| [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, both write strategies, resume checks |
 | [utils/log_utils.py](utils/log_utils.py) | Logging to stdout and to the log file |
 | [draft_zarr.ipynb](draft_zarr.ipynb) | Exploratory scratch work, not part of the pipeline |
 | [TESTING.md](TESTING.md) | How the pipeline was validated and tuned, and what that found |
@@ -202,6 +214,10 @@ CONFIG=config/other.yaml ./submit_gleam_zarr.sh         # any other config
 QUEUE=develop NCPUS=8 WALLTIME=00:30:00 \
     CONFIG=config/config_zarr_tiny.yaml ./submit_gleam_zarr.sh
 
+# the region path needs memory rather than cpus: one block is held whole, and
+# a shared develop job gets a flat 10 GB default whatever ncpus it asked for
+QUEUE=develop NCPUS=2 MEM=96GB WALLTIME=06:00:00 ./submit_gleam_zarr.sh
+
 # chain a resume behind a running job so the two never write the store at once
 AFTER=<jobid> ./submit_gleam_zarr.sh
 ```
@@ -282,23 +298,29 @@ attribute states outright rather than leaving a consumer to discover.
 | `variables` | Either a list of variable names or the shorthand `all`. `all` expands to every variable directory actually present under `raw/<temporal_resolution>/`; an explicit list is kept in the order given, and a listed variable with no directory on disk is an error rather than a silent skip. |
 | `temporal_resolution` | Which resolution to build — `daily` here. Selects the subdirectory under `raw/`, and only the one configured is built. |
 | `grid_name` | Label for the grid the data is on (`native_0p1x0p1`). Used in the store name; it describes the data rather than reprojecting it, so changing it renames the output, it does not regrid. |
-| `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. `time: 1, lat: -1, lon: -1` gives one whole global map per chunk — 24.7 MiB on the 1800x3600 grid — which is what the `spatial` suffix in the store name refers to: it is the layout for reading maps, and the worst one for reading a long time series at a point. This is the main knob on both the shape of the output and the memory a run takes; see below. |
+| `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. This is the main knob on both the shape of the output and what a run costs. `time: 1, lat: -1, lon: -1` gives one whole global map per chunk, 24.7 MiB on the 1800x3600 grid — the `spatial` layout, built for reading maps and the worst possible one for a point time series, which touches all 16802 chunks of a variable. `time: -1, lat: 20, lon: 20` gives one 2x2 degree tile through the whole record, 25.6 MiB — the `temporal` layout, where that time series is a single chunk and a global map is the worst case instead. |
+| `write_strategy` | `append` (the default) or `region`; how the store is filled. It is not a free choice: it has to match the chunking, and `resolve_write_strategy` raises rather than letting a mismatch through, because both mismatches fail quietly. An `append` build of a store whose time chunk spans the record collapses into a single uninterruptible commit that a walltime kill loses entirely; a `region` build of a shallowly chunked one reads the whole record into memory to write chunks one timestep deep. |
+| `block_shape` | `region` only. The lat/lon block read and committed as one unit, which must be a whole number of output chunks. Two things decide it. It has to be much wider than a chunk, because the raw files are chunked `[12, 57, 113]` and a block only 20 cells wide would decompress each 57x113 source chunk once for every tile it covers. And **it has to span `lon` entirely** (`lon: -1`): a narrower block reads a strided subset of the source chunks — 11 of every 32 along lon, scattered through the file — rather than contiguous runs, which measured pathologically slow on dense variables at identical volume. At `lat: 200, lon: -1` that is 45.1 GiB resident per block against 1.43x read amplification, a trade worth making because Derecho bills cpus and not memory. It is also the resume granularity, so it is what a killed job redoes. |
 
 ### The four settings that decide what a run costs
 
 These are the keys worth setting deliberately before a long job.
-`timesteps_per_commit` decides how much work a crash throws away; the other
-three decide how fast the run goes and how much memory it needs. None of the
-latter three change the store that gets written, only the resources used to
-write it — and `chunk_cache_size_mib` is worth more than the other two put
-together.
+`timesteps_per_commit` (on the `append` path) and `block_shape` (on the
+`region` path) decide how much work a crash throws away; the other three decide
+how fast the run goes and how much memory it needs. None of the latter three
+change the store that gets written, only the resources used to write it.
+
+Note that `chunk_cache_size_mib` is worth far more than the other two on the
+`append` path and much less on the `region` path, for the same reason: it exists
+to stop a twelve-deep source chunk being decompressed once per timestep, and the
+`region` path reads each source chunk once anyway, in one hyperslab per file.
 
 | Key | Default | What it controls |
 | --- | --- | --- |
-| `timesteps_per_commit` | 100 | Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask — at the configured `time: 1` the rounding is a no-op, so this only bites if `time` is raised; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
+| `timesteps_per_commit` | 100 | `append` only. Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask — at the configured `time: 1` the rounding is a no-op, so this only bites if `time` is raised; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
 | `num_workers` | dask's own, sized from the cpuset | Size of the dask thread pool, and so how many chunks are in flight — roughly `num_workers` x one chunk, about 200 MiB at 8 workers and 24.7 MiB chunks — small enough at this chunk size that the open file cache below is the larger memory term. Note that it buys much less parallelism than it looks like it should: xarray locks every netCDF read behind one process-global HDF5 lock, so reads serialize no matter how many workers there are, and only the zarr compression on the write side scales. It **must not exceed the job's `ncpus`**: if you need more workers, raise `ncpus` in [submit_gleam_zarr.sh](submit_gleam_zarr.sh) rather than lowering the config, which the script checks and refuses to launch on. |
-| `chunk_cache_size_mib` | HDF5's own, ~16 MiB | Decompressed HDF5 chunk cache held per open netCDF file. **The single largest performance setting here.** The raw files are chunked `[12, 57, 113]` — twelve timesteps deep — while the store is written one timestep at a time, so unless this holds a whole twelve-deep row of chunks (1024 chunks, 302 MiB) HDF5 decompresses every chunk twelve times over. Measured on real data: reading twelve timesteps one at a time takes 9.06 s at the default and 0.87 s at 512 MiB, and 8.24 s vs 1.09 s end to end through xarray. It changes nothing about the store. Budget it against `file_cache_maxsize`, which multiplies it, and against `num_workers`, since threads reading distant timesteps touch different chunk rows. |
-| `file_cache_maxsize` | xarray's, 128 files | How many netCDF files stay open, each holding its own 64 MiB HDF5 chunk cache — the second memory term, and easy to overlook because the files are cheap but their caches are not. It only has to cover the files one batch touches, at most two year files per variable, so `32` is generous here and well below the several idle GiB the default would hold. |
+| `chunk_cache_size_mib` | HDF5's own, ~16 MiB | Decompressed HDF5 chunk cache held per open netCDF file. **The single largest performance setting on the `append` path.** The raw files are chunked `[12, 57, 113]` — twelve timesteps deep — while an `append` build writes one timestep at a time, so unless this holds a whole twelve-deep row of chunks (1024 chunks, 302 MiB) HDF5 decompresses every chunk twelve times over. Measured on real data: reading twelve timesteps one at a time takes 9.06 s at the default and 0.87 s at 512 MiB, and 8.24 s vs 1.09 s end to end through xarray. On the `region` path it is worth much less, because a block is one contiguous hyperslab per file and every source chunk it touches is decompressed once regardless. It changes nothing about the store. Budget it against `file_cache_maxsize`, which multiplies it. |
+| `file_cache_maxsize` | xarray's, 128 files | How many netCDF files stay open, each holding its own HDF5 chunk cache — the second memory term, and easy to overlook because the files are cheap but their caches are not. It only has to cover the files one unit of work touches: at most two year files per variable on the `append` path, so `32`; every file of one variable on the `region` path, which is variable-major, so `64`. |
 
 Both memory settings are applied by `configure_runtime` before anything opens a
 file, since neither takes effect retroactively, and the resolved values are
@@ -311,27 +333,47 @@ settings it actually ran with.
    `raw/<temporal_resolution>/`, and list each variable's yearly files in time
    order.
 2. **Open** — each variable is opened with `open_mfdataset` across its whole
-   year range, concatenated along time in the order given. Note that
-   `parallel=True` is deliberately omitted: opening netCDF from several threads
-   crashes the HDF5 library in this build. Do not add it.
+   year range, concatenated along time in the order given. The chunks a file is
+   opened with are the unit dask reads in, which is *not* the same thing as the
+   store's chunking: on the `region` path it is the block, because opening 644
+   files as 20x20 tiles would build some ten million dask chunks before a byte
+   is read. Note that `parallel=True` is deliberately omitted: opening netCDF
+   from several threads crashes the HDF5 library in this build. Do not add it.
 3. **Merge** — variables are merged with `join='exact'` after an explicit check
    that they share an identical time axis. A mismatch means an incomplete
    download and is raised as an error; without the check it would surface much
    later as a silently NaN-filled variable.
 4. **Chunk** — `-1` entries in `chunks` are resolved against the now-known
-   dimension sizes. `open_mfdataset` chunks per file, so time chunks follow the
-   yearly file boundaries until this explicit rechunk squares them up.
+   dimension sizes, which is also when `write_strategy` can be checked against
+   them. On the `append` path `open_mfdataset` chunks per file, so time chunks
+   follow the yearly file boundaries until an explicit rechunk squares them up;
+   the `region` path writes from memory rather than from dask and leaves the
+   blocks chunked the way they were read.
 5. **Encode** — the netCDF encoding xarray carries over (`zlib`, `chunksizes`,
    ...) is rejected by the zarr backend, so `build_encoding` clears each
    variable's `.encoding` and rebuilds it rather than overriding keys. Time is
    pinned to `days since 1900-01-01`, proleptic_gregorian, int64 so that every
-   appended batch encodes identically.
-6. **Write** — the first batch lays down the arrays with that encoding; every
-   later batch appends along `time`. Each is committed before the next starts.
+   appended batch encodes identically. Index coordinates are kept as a single
+   chunk rather than inheriting the chunking of the data they index, which at
+   `lat: 20` would otherwise split the 1800-long `lat` coordinate into 90.
+6. **Write**, one of two ways:
+   - `append` — the first batch lays down the arrays with that encoding; every
+     later batch appends along `time`. Each is committed before the next starts.
+   - `region` — `create_skeleton` lays down the group, the array metadata and
+     the coordinates with `compute=False`, which writes no data chunk at all,
+     and commits. Each block is then read into memory whole, written into the
+     skeleton with `region=`, and committed on its own.
 
-On resume, `check_resume` compares the stored variables and the overlapping
-timesteps against the incoming dataset and refuses to append onto a store built
-from a different configuration.
+On resume the `append` path's `check_resume` compares the stored variables and
+the overlapping timesteps against the incoming dataset, and refuses to append
+onto a store built from a different configuration. The `region` path cannot lean
+on the store's length, since every array is full-sized from the moment the
+skeleton exists, so `check_resume_region` compares the variables, all three
+coordinates and the chunk grid instead, and `committed_blocks` reads the blocks
+already written back out of the commit messages. Progress lives in the history
+rather than in the store so that resuming needs nothing but the ancestry
+icechunk keeps anyway, and so `finalize_gleam_zarr.py` does not have to strip
+build bookkeeping out of the attributes it publishes.
 
 ## Conventions
 
