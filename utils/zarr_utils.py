@@ -813,5 +813,12 @@ def write_by_region(repository, dataset, blocks, done=frozenset()):
         to_icechunk(data, session, region=region)
         snapshot = session.commit(message)
         LOG.info(f'committed {message} as {snapshot}')
+
+        # drop the block before the next iteration reads one. The read happens
+        # while these are still bound, so without this the outgoing and the
+        # incoming block coexist and peak memory is two blocks rather than one
+        # -- the same doubling read_into_buffer exists to avoid, moved one
+        # level out.
+        del values, data
         n_written += 1
     return n_written

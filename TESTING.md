@@ -508,6 +508,100 @@ change, reachable bytes and history length, and exits non-zero if either moves.
 That check is the whole reason it was comfortable to run an irreversible
 operation on a store with no second copy — that, and the rehearsal above.
 
+## Building the temporal store (2026-09-11)
+
+Record of the testing for the **second** store, chunked
+`(time, lat, lon) = (16802, 20, 20)` for time-series reads, built from the same
+raw files by the new `region` write strategy. Same tiered method as 2026-09-09
+and for the same reason; what it found was again not what it went looking for.
+
+The two findings below are both cases where the volume of data moved was
+identical and the cost was not. Neither is visible in a profile of the pipeline
+— one is a property of how the source files are laid out, the other of how dask
+assembles an array — and neither shows up on a small or sparse test fixture.
+
+### 11. A block narrower than the globe reads the file strided, not sequentially
+
+The obvious way to bound the memory a region block takes is to shrink it in both
+lat and lon. That is wrong, and it is wrong for a reason that volume arithmetic
+cannot see.
+
+The raw files are chunked `[12, 57, 113]`. A block spanning all of lon touches
+every lon chunk, so each `(time chunk, lat chunk)` pair is read as one
+contiguous run of 32 source chunks. A block half as wide touches 11 of every 32,
+**scattered through the file**, and the same bytes then arrive as several times
+as many seeks.
+
+Measured on one `E` year file, cold, 512 MiB chunk cache:
+
+| read | wall | volume | rate |
+| --- | --- | --- | --- |
+| `[:, 0:600, 0:1200]` strided in lon | 29.4 s | 0.98 GiB | **34.2 MiB/s** |
+| `[:, 0:600, :]` full lon | 29.7 s | 2.95 GiB | **101.7 MiB/s** |
+| `[0:67, :, :]` whole planes, for reference | 10.9 s | 1.62 GiB | 151.4 MiB/s |
+
+3.0x for the same bytes, purely from locality. (A fourth row, `[:, 0:200, :]` at
+341.7 MiB/s, is not evidence — that band was already in page cache from the two
+reads above it. It is left out of the conclusion.)
+
+**How it was nearly missed.** The shape was first tried at `600 x 1200` on `Ec`,
+which compresses about 70:1 and finished in seconds per block. On `E`, which
+compresses about 3.4:1, the same shape sat at **9% cpu with no block committed
+in eleven minutes**. The fixture was not small, it was *sparse*, and a sparse
+variable barely touches the disk. **Test a read-pattern change on the dense
+variable.** And when a rechunk looks slow, read cpu% first: 9% says locality,
+not codec.
+
+`block_shape.lon` is now required to be `-1`, and the cost of the block is paid
+in lat alone: `lat: 200` is 45.1 GiB resident against 1.43x read amplification,
+which is the right trade when Derecho bills cpus and not memory.
+
+### 12. `.load()` doubles a block at the moment it comes together
+
+With the block shape fixed, the tier-2 bench still died — on its **first block**,
+after 59 minutes, with `RuntimeError: NetCDF: HDF error`.
+
+That error is a red herring twice over. It is not an HDF5 defect, and it is not
+really about netCDF at all. The tell is in the timings: **46 minutes of system
+time against 2 minutes of user**. A process that spends 95% of itself in the
+kernel is not computing, it is being ground through page reclaim against a
+memory cgroup, and the allocation that finally fails is simply whichever one
+came next — here, one inside HDF5, which reports it uninformatively.
+
+The budget against the job's 96 GB:
+
+| | |
+| --- | --- |
+| HDF5 chunk caches, 46 open files x 512 MiB | 23.6 GB |
+| block buffer | 48.4 GB |
+| dask holding all 46 inputs *and* allocating the concatenated output | +48.4 GB |
+| **total** | **~120 GB** |
+
+`.load()` is the obvious way to materialise a block and the wrong one at this
+size: dask holds every input chunk while it allocates the output beside them, so
+a 45 GiB block is transiently 90 GiB with nothing in the log to say so.
+`read_into_buffer` fills one preallocated array a time chunk at a time instead.
+The chunk boundaries are the file boundaries, so every read is still a single
+contiguous hyperslab out of one file, and peak memory becomes the block plus one
+slab.
+
+`chunk_cache_size_mib` was the second term, and it was inherited rather than
+chosen: 512 is the 7.6x lever on the `append` path, where the store is written
+one timestep at a time out of twelve-deep source chunks. On the `region` path it
+is not doing that job — a block is one hyperslab and every source chunk it
+touches is decompressed once regardless — but it still multiplies by the open
+file count, and a region job holds all 46 files of a variable open. At 64 MiB it
+costs 2.9 GB.
+
+Projected peak falls from ~120 GB to **49 GiB**. The append-path configs keep
+512, where it is still worth 7.6x.
+
+**The generalisation worth keeping:** on the append path peak memory is the
+chunks in flight, and `configure_runtime` bounds it. On the region path peak
+memory *is the block*, and the two settings that used to be the memory story are
+now minor next to it. The strategies do not share a cost model, and a setting
+carried from one to the other should be re-derived, not inherited.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
@@ -531,11 +625,13 @@ operation on a store with no second copy — that, and the rehearsal above.
   verified against a raw tree that did not move with it, which is the coupling
   the move runs into first. Until it moves, treat the store as reproducible
   rather than archived.
-- **`chunks: {time: 1}` is the worst possible layout for point time-series
-  reads**, which touch all 16802 chunks of a variable. Correct for the
-  `spatial` store; if that access pattern matters downstream it wants a second,
-  time-chunked store rather than a change here. Now recorded in the store's own
-  `chunking` attribute, so a consumer does not have to discover it.
+- ~~**`chunks: {time: 1}` is the worst possible layout for point time-series
+  reads**, which touch all 16802 chunks of a variable.~~ **Being addressed
+  2026-09-11**: a second store chunked `(16802, 20, 20)` is built beside it
+  rather than changing this one, which stays correct for maps. See *Building
+  the temporal store*. Both layouts are recorded in their stores' own
+  `chunking` attributes, each pointing at the other, so a consumer does not
+  have to discover either.
 - **The store is not CF compliant, and is not claimed to be.** Each variable's
   `standard_name` and `units` come through unaltered from upstream, so the
   standard names are descriptive strings and the units (`mm.day-1`, `m3.m-3`)
