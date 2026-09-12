@@ -602,6 +602,65 @@ memory *is the block*, and the two settings that used to be the memory story are
 now minor next to it. The strategies do not share a cost model, and a setting
 carried from one to the other should be re-derived, not inherited.
 
+### Tier 2 outcome: Ep, all 46 years (job 7403373, 2026-09-11)
+
+Nine blocks, 0.40 TiB logical, **137 min**, exit 0. Tier 1 rebuilt and verified
+clean in the same job (27 checks, 0 failures).
+
+| | |
+| --- | --- |
+| per block (45.1 GiB logical) | 11.4 - 19.6 min, mean 15.2 |
+| throughput | 0.0455 GiB/s logical |
+| spatial build, for comparison | 0.111 GiB/s |
+| cpu actually used | **0.47 cores**, while billing 2 |
+| `Ep` compressed | **123 GiB**, against 123.8 GiB for the same variable in the spatial store |
+
+**The region path is 2.4x slower per logical byte than the append path**, and
+that is explained rather than mysterious: 1.43x read amplification from the lat
+band, times 1.49x worse locality than a whole-plane read (101.7 against
+151.4 MiB/s in the finding 11 probe). 1.43 x 1.49 = 2.13, near enough.
+
+**The layout buys no space.** 123 GiB against 123.8 GiB for the same variable.
+The ocean tiles that vanish entirely here were already compressing to almost
+nothing in the spatial store, so the saving that looked available from the chunk
+counts -- 43% of the grid written on the tiny fixture -- is not a saving in
+bytes. Budget the finished temporal store at ~1.03 TiB, the same as its sibling.
+
+### Sizing the production chain from two runs
+
+Cost was fitted as `a x (raw bytes decompressed) + b x (logical bytes written)`
+against the two full-scale runs there are -- the spatial production build
+(1097 GB raw, 5686 GB logical, 14.2 h) and this bench (127 GB raw x 1.43, 406 GB
+logical, 2.29 h):
+
+    a = 12.3 h per TB decompressed      b = 0.12 h per TB written
+
+Decompressing the raw files is ~97% of it, which is why scaling by *logical*
+volume overestimates so badly: the 14 variables are identical in logical size
+but range from 6.2 GB to 128 GB of raw bytes, and the sparse ones are nearly
+free. Pure logical scaling says 32 h; the fit says **20 h**.
+
+| lat band | read amplification | projected wall | core-hours at ncpus=1 |
+| --- | --- | --- | --- |
+| 200 (benched) | 1.43x | 20.0 h | 20.0 |
+| 360 | 1.27x | 17.9 h | 17.9 |
+| 600 | 1.14x | 16.1 h | 16.1 |
+
+### 13. `Used Mem` in qhist is not peak RSS
+
+The bench reported `Used Mem = 96.00000381469727` against a `mem=96GB` request,
+which reads like the job pressing against its ceiling. It is not. The cgroup
+counter includes reclaimable page cache, which a job reading a terabyte of
+netCDF fills to the limit as a matter of course. The same column reads exactly
+`32.0` for the 2026-09-09 production jobs, whose real high-water was 16.8 GB.
+
+The number is only diagnostic when a job **fails**: job 7401899 died reporting
+66.13 GB against the same 96 GB cap, and that is the tell -- not that it reached
+the cap, but that it did not, because the allocation that was refused (a ~48 GB
+concatenation buffer on top of 66 GB already resident) never became resident to
+be counted. Read it with the sys/user ratio beside it: 78% of wall in system
+time for the failed run against 18% for the healthy one.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
