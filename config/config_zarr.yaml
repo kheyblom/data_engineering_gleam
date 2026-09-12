@@ -34,9 +34,12 @@ write_strategy: region
 block_shape:
   lat: 200
   lon: -1
-# the build is ~1 core whatever this says: xarray serialises every netCDF read
-# behind one process global HDF5 lock. Sized to the job, not to the work
-num_workers: 2
+# the region path reads one block a time chunk at a time, a serial loop behind
+# one process global HDF5 lock, so this buys nothing here -- the tier-2 bench
+# measured 0.47 cores while it was billing 2. Matched to ncpus=1, which is what
+# the production chain asks for, so the job script's oversubscription guard
+# cannot trip on a shared node that reports fewer cpus than expected.
+num_workers: 1
 # a block reads every file of one variable, not two year files per variable
 file_cache_maxsize: 64
 # 64 rather than the append path's 512. A block is one contiguous hyperslab per
