@@ -1037,8 +1037,11 @@ is not known to work.
   store of 1.041 TiB; it is now **28 stores totalling ~2.1 T**, beside ~1.7 TiB
   of raw, all still on `/glade/derecho/scratch` and all still subject to the
   purge policy. **Accepted, 2026-09-10 and again 2026-09-14**: the stores stay
-  on scratch, and a copy is taken to `/glade/campaign/univ/umic0112` as a backup
-  rather than moving them. `directories.raw` exists so a store read from
+  on scratch, and a backup copy to `/glade/campaign/univ/umic0112` is **planned
+  but not yet taken** (5.0 T free, 0 used) rather than moving them. Until that
+  copy exists and has been verified, there is one copy of 2.1 T of verified data
+  on a purged filesystem, and the honest description is still reproducible
+  rather than archived. `directories.raw` exists so a store read from
   somewhere else can still be verified against a raw tree that did not move with
   it, which is the coupling any move runs into first.
 - ~~**`chunks: {time: 1}` is the worst possible layout for point time-series
