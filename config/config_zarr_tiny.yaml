@@ -7,7 +7,9 @@ directories:
   download: /glade/derecho/scratch/kheyblom/data/gleam_tiny/
   logs: ./logs
 output_conventions:
-  filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
+  # one store per variable: the layout is the directory, the variable is the
+  # name. Quoted because a YAML scalar opening with '{' is a flow mapping
+  filename: '{suffix}/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr'
   # not 'spatial': the staged tree already isolates this store by directory, but
   # a distinct name means a mistyped path cannot quietly resolve to a real store
   suffix: tiny

@@ -24,7 +24,8 @@ right -- so the split is not trusted either.
 
 ```bash
 uv sync                                             # create/refresh .venv from uv.lock
-uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml
+uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E                                    # omit to build all 14
 uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
     --variable E                                    # one store of the layout
 
@@ -253,9 +254,21 @@ way, so worst-case memory is `file_cache_maxsize` x `chunk_cache_size_mib`.
   `len(ancestry(...))` and the object count in `snapshots/` before concluding
   anything. `expire_snapshots` is never needed to clean these up, and reclaims
   essentially no bytes; `garbage_collect` alone is the right tool.
-- `merge_variables` requires an exact time-axis match across variables and
-  merges with `join='exact'`; a mismatch means an incomplete download and would
-  otherwise surface as a silently NaN-filled variable.
+- Nothing merges the variables any more, so nothing would notice one of them
+  being a year short — it would surface as a silently NaN-filled variable, or as
+  two sibling stores that do not line up. `check_time_axis` replaces that guard:
+  every build compares its own time axis against the family's **first** variable,
+  read from the netCDF headers, so the family is pinned collectively without any
+  build knowing about the others. It raises before anything is written.
+- A store's `title` and `summary` are **derived, not configured**
+  (`describe_variable`): a config cannot reach the netCDF `long_name`, so a
+  templated title could only say `Ep_aero` where this says 'potential
+  evaporation from the aerodynamic component'. Only the build calls it —
+  finalization deliberately does not, or a wording change would rewrite the
+  title of every published store.
+- `variable_attrs` in a config carries attributes true of one variable rather
+  than of the layout, merged over the shared `attrs`. Only `E` has any: its
+  upstream data gap. A store must not carry a note about data it does not hold.
 - `create_skeleton` rechunks time to `-1` before `to_zarr(compute=False)`. No
   data is written there, but xarray validates chunk alignment anyway and refuses
   a store chunk that straddles several dask chunks — which the per-file time

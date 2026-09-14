@@ -194,41 +194,62 @@ def open_variable(files, chunks):
     )
 
 
-def merge_variables(datasets):
-    """Merge the per variable datasets into one, checking they share a time axis.
+def read_time_axis(files):
+    """Read a variable's whole time axis from the file headers.
+
+    A metadata read: it opens each file for its time coordinate and nothing
+    else, so checking a 46 file variable costs no data I/O.
 
     Args:
-        datasets (dict): Variable name -> single variable dataset.
+        files (list): The variable's netCDF files, in time order.
 
     Returns:
-        xarray.Dataset: All variables on a common set of coordinates.
+        numpy.ndarray: The concatenated time values, as the files encode them.
+    """
+    values = []
+    for path in files:
+        dataset = netCDF4.Dataset(path)
+        values.append(np.asarray(dataset.variables['time'][:]))
+        dataset.close()
+    return np.concatenate(values)
+
+
+def check_time_axis(variable, files, reference_variable, reference_files):
+    """Check one variable covers the same timesteps as the family's reference.
+
+    A store holds one variable now, so nothing merges the variables together and
+    nothing would notice that one of them is a year short -- it would surface
+    much later as a silently NaN filled variable, or as two sibling stores that
+    do not line up. Each build checks itself against the same reference variable
+    instead, which pins the whole family collectively without any of the builds
+    having to know about each other.
+
+    Args:
+        variable (str): The variable being built.
+        files (list): Its netCDF files, in time order.
+        reference_variable (str): The variable to compare against.
+        reference_files (list): The reference's netCDF files, in time order.
 
     Raises:
-        ValueError: If the variables do not all cover the same timesteps.
+        ValueError: If the two do not cover identical timesteps.
     """
-    names = list(datasets)
-    reference_name = names[0]
-    reference = datasets[reference_name]
-
-    # a mismatch here means an incomplete download, and would otherwise surface
-    # much later as a silently reindexed (NaN filled) variable
-    for name in names[1:]:
-        time = datasets[name]['time']
-        if time.sizes['time'] != reference.sizes['time'] or not time.equals(
-            reference['time']
-        ):
-            raise ValueError(
-                f'variable {name!r} has {time.sizes["time"]} timesteps that do '
-                f'not match {reference_name!r} with '
-                f'{reference.sizes["time"]}; the download may be incomplete'
-            )
-
-    # join='exact' keeps the merge from quietly padding a mismatched grid
-    return xr.merge(
-        [datasets[name] for name in names],
-        join='exact',
-        combine_attrs='drop_conflicts',
-    )
+    if variable == reference_variable:
+        return
+    time = read_time_axis(files)
+    reference = read_time_axis(reference_files)
+    if time.size != reference.size:
+        raise ValueError(
+            f'variable {variable!r} has {time.size} timesteps that do not match '
+            f'{reference_variable!r} with {reference.size}; the download may be '
+            f'incomplete'
+        )
+    if not np.array_equal(time, reference):
+        differing = int(np.flatnonzero(time != reference)[0])
+        raise ValueError(
+            f'variable {variable!r} covers different timesteps from '
+            f'{reference_variable!r}, first differing at index {differing}; '
+            f'the download may be incomplete or misordered'
+        )
 
 
 def build_encoding(dataset, chunks, time_coord_chunk):
@@ -321,6 +342,62 @@ def derive_attrs(dataset):
         'geospatial_lon_max': round(float(lon.max()), 4),
         'geospatial_lat_resolution': round(lat_step, 4),
         'geospatial_lon_resolution': round(lon_step, 4),
+    }
+
+
+def describe_variable(dataset, settings):
+    """Title and summary for a store holding exactly one variable.
+
+    Derived rather than configured because the useful words are the variable's
+    own: a config cannot reach ``long_name``, so a templated title could only
+    say 'Ep_aero' where this says 'potential evaporation from the aerodynamic
+    component'. Every GLEAM ``long_name`` ends '... from GLEAM 4.3a', which
+    reads twice over inside a title that already names the dataset, so it is
+    dropped.
+
+    Only the build calls this. Finalization deliberately does not: it would
+    otherwise rewrite the title of every finished store whenever this wording
+    changed, and a store that has been published should keep the words it was
+    published with.
+
+    Args:
+        dataset (xarray.Dataset): The dataset being written.
+        settings (dict): The loaded configuration.
+
+    Returns:
+        dict: ``title`` and ``summary``, or empty if the dataset does not hold
+            exactly one data variable.
+    """
+    names = list(dataset.data_vars)
+    if len(names) != 1:
+        return {}
+    name = names[0]
+    long_name = dataset[name].attrs.get('long_name', name).split(' from GLEAM ')[0]
+    units = dataset[name].attrs.get('units', '')
+
+    chunks = resolve_chunks(settings['chunks'], dataset.sizes)
+    chunked_for = (
+        'time series'
+        if chunks['time'] >= dataset.sizes['time']
+        else 'maps and fields'
+    )
+    time = dataset['time'].values
+    span = f'{str(time.min())[:4]}-{str(time.max())[:4]}'
+    lat = dataset['lat'].values
+    grid = f'native {abs(float(lat[1] - lat[0])):g} degree global grid'
+    label = f'GLEAM {settings["version"]} {settings["temporal_resolution"]}'
+
+    return {
+        'title': (
+            f'{label} {long_name[0].lower() + long_name[1:]} ({name}), {grid}, '
+            f'{span}, chunked for {chunked_for}'
+        ),
+        'summary': (
+            f'{long_name} ({name}, {units}) from {label}, on the {grid} over '
+            f'{span}. One variable per store: the other GLEAM variables are in '
+            f'sibling stores beside this one, on the same grid and the same '
+            f'time axis.'
+        ),
     }
 
 

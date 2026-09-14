@@ -174,6 +174,10 @@ def format_attrs(settings):
     uses, so attribute text can refer to ``{version}`` or ``{grid_name}``
     instead of repeating them and drifting from the rest of the config.
 
+    An optional ``variable_attrs`` section, keyed by variable name, carries
+    attributes that belong to one variable rather than to the layout; the entry
+    for the store being built is merged over the shared ones.
+
     Args:
         settings (dict): The loaded configuration.
 
@@ -185,20 +189,32 @@ def format_attrs(settings):
         ValueError: If a template refers to a field the config does not define.
     """
     fields = template_fields(settings)
+    # a store holds one variable, and a few attributes are true of one variable
+    # rather than of the layout -- E's upstream data gap is the only one so far.
+    # They live under variable_attrs, keyed by variable, and override the shared
+    # ones for the store being built
+    sources = [settings.get('attrs') or {}]
+    per_variable = (settings.get('variable_attrs') or {}).get(
+        settings.get('variable')
+    )
+    if per_variable:
+        sources.append(per_variable)
+
     attrs = {}
-    for name, value in (settings.get('attrs') or {}).items():
-        # numbers and booleans are legitimate attribute values with nothing to
-        # template, so only strings go through format_map
-        if not isinstance(value, str):
-            attrs[name] = value
-            continue
-        try:
-            attrs[name] = value.format_map(fields)
-        except KeyError as error:
-            raise ValueError(
-                f'attribute {name!r} refers to {error} which is not set '
-                f'in the config'
-            ) from None
+    for source in sources:
+        for name, value in source.items():
+            # numbers and booleans are legitimate attribute values with nothing
+            # to template, so only strings go through format_map
+            if not isinstance(value, str):
+                attrs[name] = value
+                continue
+            try:
+                attrs[name] = value.format_map(fields)
+            except KeyError as error:
+                raise ValueError(
+                    f'attribute {name!r} refers to {error} which is not set '
+                    f'in the config'
+                ) from None
     return attrs
 
 

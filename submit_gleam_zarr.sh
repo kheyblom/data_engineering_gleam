@@ -53,9 +53,12 @@ if [[ -z ${PBS_ENVIRONMENT:-} ]]; then
     if [[ -n ${AFTER:-} ]]; then
         qsub_args+=(-W "depend=${DEPEND}:${AFTER}")
     fi
-    if [[ -n ${CONFIG:-} ]]; then
-        qsub_args+=(-v "CONFIG=${CONFIG}")
+    # VARIABLE names one store; unset, the job fans out over the whole family
+    qsub_vars="CONFIG=${CONFIG:-}"
+    if [[ -n ${VARIABLE:-} ]]; then
+        qsub_vars="${qsub_vars},VARIABLE=${VARIABLE}"
     fi
+    qsub_args+=(-v "${qsub_vars}")
     # an absolute path so the submission does not depend on the caller's cwd
     exec qsub "${qsub_args[@]}" "$(readlink -f "$0")"
 fi
@@ -93,18 +96,47 @@ echo "queue    ${PBS_QUEUE:-unset}"
 # The cpu count comes from the affinity mask rather than $NCPUS or nproc, both of
 # which lie here: on a shared develop node PBS reports NCPUS=1 whatever it
 # granted, and nproc reports OMP_NUM_THREADS, which this script pins to 1.
-read -r workers available < <(uv run python -c "
+# one store per variable, and the stores of a layout are independent
+# repositories, so the variables are built in parallel processes rather than in
+# one long serial run. VARIABLE builds just one of them.
+read -r workers available family < <(uv run python -c "
 import os
-from utils.path_utils import load_config
-print(load_config('${CONFIG}').get('num_workers') or 0, len(os.sched_getaffinity(0)))
+from utils.path_utils import load_config, resolve_variables
+settings = load_config('${CONFIG}')
+print(load_config('${CONFIG}').get('num_workers') or 0,
+      len(os.sched_getaffinity(0)),
+      ' '.join(resolve_variables(settings)))
 ")
-echo "workers  num_workers=${workers:-unset}, cpus available=${available}"
-if (( workers > available )); then
-    echo "error: num_workers=${workers} in ${CONFIG} exceeds the ${available} cpus" >&2
-    echo "       this job can use; raise ncpus or lower num_workers" >&2
+VARIABLES="${VARIABLE:-${family}}"
+n_processes=$(wc -w <<< "${VARIABLES}")
+
+# an oversubscribed run would multiply its chunks in flight straight past the
+# memory the job reserved, and with one process per variable the count that
+# matters is processes x workers rather than workers alone
+demand=$(( n_processes * (workers > 0 ? workers : 1) ))
+echo "workers  num_workers=${workers:-unset} x ${n_processes} processes = ${demand}, cpus available=${available}"
+if (( demand > available )); then
+    echo "error: ${n_processes} processes x num_workers=${workers} in ${CONFIG}" >&2
+    echo "       exceeds the ${available} cpus this job can use; raise ncpus," >&2
+    echo "       lower num_workers, or build fewer variables per job" >&2
     exit 1
 fi
 
-uv run python gleam_zarr.py --config "${CONFIG}"
+pids=""
+for variable in ${VARIABLES}; do
+    uv run python gleam_zarr.py --config "${CONFIG}" --variable "${variable}" &
+    pids="${pids} $!:${variable}"
+done
+
+status=0
+for entry in ${pids}; do
+    if wait "${entry%%:*}"; then
+        echo "ok     ${entry##*:}"
+    else
+        echo "FAILED ${entry##*:}"
+        status=1
+    fi
+done
 
 echo "finished $(date)"
+exit ${status}

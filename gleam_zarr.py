@@ -3,14 +3,21 @@
 The raw tree written by the download step holds one directory per variable, each
 with one netCDF file per year:
 ``<download>/<version>/raw/<temporal_resolution>/<variable>/<file>.nc``, with the
-version written as ``v_4_3_a`` rather than ``v4.3a``. This script opens every
-configured variable across that whole year range, merges them onto a shared
-time/lat/lon grid, and writes the result as a single zarr store named after
-``output_conventions.filename``, next to ``raw`` in the same version tree.
+version written as ``v_4_3_a`` rather than ``v4.3a``. This script opens one
+variable across that whole year range and writes it as its own zarr store,
+named after ``output_conventions.filename``, next to ``raw`` in the same version
+tree.
 
-Everything is driven by the config: ``version``, ``temporal_resolution`` (only
-the one set is built), ``variables`` (a list, or ``all`` to take every variable
-present on disk), and ``chunks``, where -1 means the whole dimension.
+**One store holds one variable.** ``--variable`` picks which, and the filename
+template renders it, so one config addresses a whole layout -- the 14 stores
+that share a chunking -- and the stores of a layout are independent
+repositories with no writer to contend over. Run without ``--variable`` the
+script builds the layout's whole family one at a time, which is what a small or
+test config usually wants; production fans out one process per variable instead.
+
+Everything else is driven by the config: ``version``, ``temporal_resolution``
+(only the one set is built), ``variables`` (a list, or ``all`` to take every
+variable present on disk), and ``chunks``, where -1 means the whole dimension.
 
 The write is incremental either way, so an interrupted run resumes from the last
 commit rather than starting over, but what a commit covers follows the chunking
@@ -52,14 +59,15 @@ from utils.zarr_utils import (
     build_encoding,
     check_resume,
     check_resume_region,
+    check_time_axis,
     commit_batch_size,
     committed_blocks,
     committed_timesteps,
     configure_runtime,
     create_skeleton,
     derive_attrs,
+    describe_variable,
     iter_blocks,
-    merge_variables,
     open_repository,
     open_variable,
     resolve_block_shape,
@@ -73,35 +81,22 @@ from utils.zarr_utils import (
 LOG = logging.getLogger(__name__)
 
 
-def open_variables(settings, variables, chunks):
-    """Open every variable as a lazy dataset, keyed by variable name.
+def build_dataset(settings, variable, reference):
+    """Assemble the one variable dataset to write.
 
     Args:
         settings (dict): The loaded configuration.
-        variables (list): Variable names to open.
-        chunks (dict): Chunk sizes to open the files with.
+        variable (str): The variable to build a store for.
+        reference (str): The family's reference variable, whose time axis this
+            one is checked against.
 
     Returns:
-        dict: Variable name -> single variable dataset.
-    """
-    datasets = {}
-    for variable in variables:
-        files = variable_files(settings, variable)
-        LOG.info(f'opening {len(files)} files for {variable}')
-        datasets[variable] = open_variable(files, chunks)
-    return datasets
+        tuple: The xarray.Dataset, its resolved chunk sizes, and the write
+            strategy to use.
 
-
-def build_dataset(settings, variables):
-    """Assemble the merged dataset to write.
-
-    Args:
-        settings (dict): The loaded configuration.
-        variables (list): Variable names to merge.
-
-    Returns:
-        tuple: The merged xarray.Dataset, its resolved chunk sizes, and the
-            write strategy to use.
+    Raises:
+        ValueError: If this variable does not cover the same timesteps as the
+            reference.
     """
     # the chunks a file is opened with are the unit dask reads in, which is the
     # store's own chunking on the append path but the block on the region path.
@@ -111,7 +106,14 @@ def build_dataset(settings, variables):
     read_chunks = (
         block_read_chunks(settings) if strategy == 'region' else settings['chunks']
     )
-    dataset = merge_variables(open_variables(settings, variables, read_chunks))
+
+    files = variable_files(settings, variable)
+    # nothing merges the variables any more, so nothing would notice one of them
+    # being a year short. Each build pins itself to the same reference instead
+    check_time_axis(variable, files, reference, variable_files(settings, reference))
+
+    LOG.info(f'opening {len(files)} files for {variable}')
+    dataset = open_variable(files, read_chunks)
 
     # -1 in the config means the whole dimension, which is only known now that
     # the files are open
@@ -125,14 +127,18 @@ def build_dataset(settings, variables):
         # chunked the way they were read
         dataset = dataset.chunk(chunks)
 
-    # merge_variables carries the source files' own attributes over; the derived
+    # open_mfdataset carries the source files' own attributes over; the derived
     # and configured ones go on top of those so upstream provenance survives
     # beside them. Only the first write lays them down
-    dataset.attrs.update(derive_attrs(dataset) | format_attrs(settings))
+    dataset.attrs.update(
+        derive_attrs(dataset)
+        | describe_variable(dataset, settings)
+        | format_attrs(settings)
+    )
 
     LOG.info(
-        f'merged {len(dataset.data_vars)} variables: '
-        f'{dict(dataset.sizes)}, {dataset.nbytes / 1024**4:.2f} TiB'
+        f'{variable}: {dict(dataset.sizes)}, '
+        f'{dataset.nbytes / 1024**4:.2f} TiB logical'
     )
     LOG.info(f'carrying {len(dataset.attrs)} global attributes')
     LOG.info(f'chunking as {chunks}, write strategy {strategy!r}')
@@ -178,7 +184,7 @@ def write_append(repository, dataset, chunks, settings):
     return write_dataset(repository, dataset, encoding, batch_size, start=n_written)
 
 
-def write_region(repository, dataset, chunks, settings, variables):
+def write_region(repository, dataset, chunks, settings, variable):
     """Write the store as a skeleton, then fill it block by block.
 
     Args:
@@ -186,7 +192,7 @@ def write_region(repository, dataset, chunks, settings, variables):
         dataset (xarray.Dataset): The lazy dataset to write.
         chunks (dict): Resolved chunk sizes.
         settings (dict): The loaded configuration.
-        variables (list): Variable names to write, in a stable order.
+        variable (str): The variable the store holds.
 
     Returns:
         int: The number of blocks written.
@@ -195,7 +201,7 @@ def write_region(repository, dataset, chunks, settings, variables):
         ValueError: If a partially filled store cannot be resumed into.
     """
     block_shape = resolve_block_shape(settings, chunks, dataset.sizes)
-    blocks = iter_blocks(variables, dataset.sizes, block_shape)
+    blocks = iter_blocks([variable], dataset.sizes, block_shape)
     LOG.info(f'blocking as {block_shape}: {len(blocks)} blocks')
 
     # build_encoding also clears the stale netCDF encoding off every variable,
@@ -223,29 +229,21 @@ def write_region(repository, dataset, chunks, settings, variables):
     return write_by_region(repository, dataset, blocks, done)
 
 
-def main(settings):
+def build_store(settings, variable, reference):
+    """Build the store holding one variable.
 
-    os.makedirs(settings['directories']['logs'], exist_ok=True)
-    log_file = os.path.join(settings['directories']['logs'], settings['log_file'])
-    setup_logging(log_file)
+    Args:
+        settings (dict): The loaded configuration, with ``variable`` set.
+        variable (str): The variable to build.
+        reference (str): The family's reference variable for the time axis check.
 
-    # set before anything opens a file or builds a graph, since both settings
-    # only take effect for work started after them
-    configure_runtime(settings)
-
+    Returns:
+        str: The path written.
+    """
     path = store_path(settings)
-    LOG.info(
-        f'building zarr store for GLEAM {settings["version"]} '
-        f'({settings["temporal_resolution"]}, variables: {settings["variables"]})'
-    )
-    LOG.info(f'reading from {raw_dir(settings)}')
     LOG.info(f'writing to {path}')
 
-    # expand 'variables: all' against what was actually downloaded
-    variables = resolve_variables(settings)
-    LOG.info(f'merging {len(variables)} variables: {variables}')
-
-    dataset, chunks, strategy = build_dataset(settings, variables)
+    dataset, chunks, strategy = build_dataset(settings, variable, reference)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     repository = open_repository(path)
@@ -254,8 +252,54 @@ def main(settings):
         written = write_append(repository, dataset, chunks, settings)
         LOG.info(f'wrote {written} batches to {path}')
     else:
-        written = write_region(repository, dataset, chunks, settings, variables)
+        written = write_region(repository, dataset, chunks, settings, variable)
         LOG.info(f'wrote {written} blocks to {path}')
+    return path
+
+
+def main(settings, variable=None):
+    """Build one store, or the layout's whole family.
+
+    Args:
+        settings (dict): The loaded configuration.
+        variable (str): The single variable to build, or None for all of them.
+
+    Raises:
+        ValueError: If ``variable`` is not one of the family's.
+    """
+    # expand 'variables: all' against what was actually downloaded. The family
+    # is needed whichever is built: its first member is the reference every
+    # variable's time axis is checked against
+    family = resolve_variables(settings)
+    if variable is not None and variable not in family:
+        raise ValueError(f'{variable!r} is not in the family {family}')
+    reference = family[0]
+    building = [variable] if variable else family
+
+    os.makedirs(settings['directories']['logs'], exist_ok=True)
+    # one log per store when one store is named, so the processes of a fanned
+    # out build do not interleave into a single file
+    stem, extension = os.path.splitext(settings['log_file'])
+    log_file = os.path.join(
+        settings['directories']['logs'],
+        f'{stem}_{variable}{extension}' if variable else settings['log_file'],
+    )
+    setup_logging(log_file)
+
+    # set before anything opens a file or builds a graph, since both settings
+    # only take effect for work started after them
+    configure_runtime(settings)
+
+    LOG.info(
+        f'building GLEAM {settings["version"]} ({settings["temporal_resolution"]}), '
+        f'{len(building)} of {len(family)} variables: {building}'
+    )
+    LOG.info(f'reading from {raw_dir(settings)}')
+
+    for name in building:
+        # store_path renders the variable, so it is set before the path is built
+        settings['variable'] = name
+        build_store(settings, name, reference)
 
     LOG.info('done :-)')
 
@@ -270,6 +314,14 @@ if __name__ == '__main__':
         required=True,
         help='Path to YAML configuration file.',
     )
+    parser.add_argument(
+        '--variable',
+        type=str,
+        default=None,
+        help='Build the store for this one variable. Omitted, every variable of '
+        'the layout is built in turn, which is what a test config usually wants; '
+        'a production run fans out one process per variable instead.',
+    )
     args = parser.parse_args()
     settings = load_config(args.config)
-    main(settings)
+    main(settings, args.variable)

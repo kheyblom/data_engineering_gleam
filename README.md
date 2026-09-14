@@ -227,19 +227,27 @@ is run from the repo root):
 uv sync
 ```
 
-Run the build directly, which is fine for a short test or a small subset:
+A build produces one store per variable. Run it directly for a short test or a
+small subset — with `--variable` for a single store, without it for the layout's
+whole family, one at a time:
 
 ```bash
-uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml
+uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml --variable E
+uv run python gleam_zarr.py --config config/config_zarr_tiny.yaml
 ```
 
 A full build is far too heavy for a login node, so **submit it as a batch job**
 with [submit_gleam_zarr.sh](submit_gleam_zarr.sh), which requests a Derecho node
 and runs the same command inside it:
 
+The job builds the layout's 14 variables as 14 parallel processes: the stores
+are independent repositories, so there is no branch for them to contend over and
+no reason to build them one after another. `VARIABLE=` builds just one.
+
 ```bash
 ./submit_gleam_zarr.sh                                  # default config
 CONFIG=config/other.yaml ./submit_gleam_zarr.sh         # any other config
+VARIABLE=E ./submit_gleam_zarr.sh                       # one store only
 
 # a short test on the shared develop queue, billed for the cpus it asks for
 QUEUE=develop NCPUS=8 WALLTIME=00:30:00 \
@@ -314,14 +322,31 @@ Each string value is a template over the same fields the `filename` template
 uses, with `{version_label}` for the version as the config writes it (`v4.3a`)
 alongside `{version}` for the on-disk spelling (`v_4_3_a`).
 
-Three things stay out of this section deliberately. The coverage and grid
-attributes (`time_coverage_*`, `geospatial_*`) are derived from the data by
-`derive_attrs`, so they cannot drift from what was actually written. The source
-files' own attributes are carried over by the merge and kept underneath these,
-so GLEAM's upstream provenance survives. And `Conventions` is `ACDD-1.3` rather
+Things stay out of this section deliberately. The coverage and grid attributes
+(`time_coverage_*`, `geospatial_*`) are derived from the data by `derive_attrs`,
+so they cannot drift from what was actually written, and `title` and `summary`
+are derived by `describe_variable` for the same reason — a config cannot reach
+the netCDF `long_name`, so a templated title could only name the variable where
+a derived one can say what it is. The source files' own attributes are carried
+over from the netCDF files and kept underneath these, so GLEAM's upstream
+provenance survives. And `Conventions` is `ACDD-1.3` rather
 than a CF version: the variables' `standard_name` and `units` come through
 unaltered from upstream and are not CF-valid, which the `cf_compliance`
 attribute states outright rather than leaving a consumer to discover.
+
+### `variable_attrs`
+
+Optional. Attributes that belong to one variable rather than to the layout,
+keyed by variable name and merged over `attrs` for the store being built. Only
+`E` has any in practice: its 25 upstream-missing days are a property of that
+variable, and a store must not carry a note about data it does not hold.
+
+```yaml
+variable_attrs:
+  E:
+    known_data_gaps: >-
+      This variable is entirely fill (NaN) on 25 days ...
+```
 
 ### Top-level keys
 
@@ -366,17 +391,19 @@ settings it actually ran with.
 1. **Resolve** — expand `variables: all` against the directories present under
    `raw/<temporal_resolution>/`, and list each variable's yearly files in time
    order.
-2. **Open** — each variable is opened with `open_mfdataset` across its whole
+2. **Open** — the variable is opened with `open_mfdataset` across its whole
    year range, concatenated along time in the order given. The chunks a file is
    opened with are the unit dask reads in, which is *not* the same thing as the
    store's chunking: on the `region` path it is the block, because opening 644
    files as 20x20 tiles would build some ten million dask chunks before a byte
    is read. Note that `parallel=True` is deliberately omitted: opening netCDF
    from several threads crashes the HDF5 library in this build. Do not add it.
-3. **Merge** — variables are merged with `join='exact'` after an explicit check
-   that they share an identical time axis. A mismatch means an incomplete
-   download and is raised as an error; without the check it would surface much
-   later as a silently NaN-filled variable.
+3. **Check the time axis** — the variable's timesteps are compared against the
+   family's first variable, read from the netCDF headers. Nothing merges the
+   variables now that a store holds one, so nothing else would notice one of
+   them being a year short: it would surface much later as a silently NaN-filled
+   variable, or as two sibling stores that do not line up. A mismatch is raised
+   before anything is written.
 4. **Chunk** — `-1` entries in `chunks` are resolved against the now-known
    dimension sizes, which is also when `write_strategy` can be checked against
    them. On the `append` path `open_mfdataset` chunks per file, so time chunks

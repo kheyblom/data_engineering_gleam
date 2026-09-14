@@ -75,6 +75,11 @@ attrs:
   references: >-
     https://www.gleam.eu/ -- the dataset citations are in the Reference1 and
     Reference2 attributes carried over from the source files
+  known_data_gaps: >-
+    Chunks absent from this store are the 2x2 degree tiles
+    that are fill across the entire record, which is ocean; zarr does not write
+    a chunk whose cells are all fill. More than half the chunk grid is absent
+    for this reason and that is correct.
   chunking: >-
     Chunked (time, lat, lon) = (16802, 20, 20), float32, zstd: one 2 x 2 degree
     tile through the whole 46 year record per chunk, 25.6 MiB. Built for reading
@@ -99,3 +104,20 @@ attrs:
     approximate. Absent chunks are cross-checked against the manifests of the other 13 variables, and every tile that another variable wrote was read from raw across the whole record to confirm it really is empty here. The GLEAM component identities -- E against its six
     components, Ep against its two -- are checked from the store holding the
     total, which reads the component stores alongside it.
+
+# Attributes that belong to one variable rather than to the layout, keyed by
+# variable and merged over the shared ones above. Only E has any: its upstream
+# gap is a property of that variable, and a store must not carry a note about
+# data it does not hold.
+variable_attrs:
+  E:
+    known_data_gaps: >-
+      This variable is entirely fill (NaN) on 25 days -- five 5-day
+      blocks, 1982-02-05..02-09 and 1992-01-01..01-05, 03-21..03-25,
+      05-20..05-24 and 10-02..10-06 -- while every other GLEAM variable,
+      including E's own components, has data on those days. This is a
+      gap in upstream GLEAM {version_label}, not a conversion defect.
+      Chunks absent from this store are the 2x2 degree tiles that are
+      fill across the entire record, which is ocean; zarr does not write
+      a chunk whose cells are all fill. More than half the chunk grid is
+      absent for this reason and that is correct.

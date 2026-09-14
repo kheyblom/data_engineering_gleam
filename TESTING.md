@@ -856,6 +856,88 @@ The configs stopped addressing them a commit earlier, which is its own small
 safeguard: after the template gained `{variable}`, no config could render the
 path of an all-variable store even by accident.
 
+## Refactoring the pipeline to build per-variable stores (2026-09-14)
+
+`gleam_zarr.py` still merged every variable into one store, so the pipeline
+could not reproduce what was on disk -- the only thing that had ever produced
+the per-variable layout was a one-off script, since deleted. A build now writes
+one variable per store, `--variable` picks which, and omitting it builds the
+layout's family one at a time.
+
+### 18. Deleting the merge deletes a check
+
+`merge_variables` was not only a merge: it refused to proceed unless every
+variable covered identical timesteps, because a partial download would
+otherwise surface as a silently NaN-filled variable. With one variable per
+store there is no merge left to notice.
+
+`check_time_axis` replaces it by comparing each variable against the family's
+**first**, read from the netCDF headers rather than by opening data. Each of the
+14 builds checks itself against the same reference, which pins the family
+collectively without any build knowing about the others, and costs one pass over
+46 file headers.
+
+A guard nobody has watched fail is not known to work, so it was made to fail: a
+staged tree with `Ec` one year short raised
+
+```
+ValueError: variable 'Ec' has 366 timesteps that do not match 'E' with 731;
+the download may be incomplete
+```
+
+and **no zarr directory was created** -- it stops before writing, which is the
+whole point.
+
+### 19. A derived title says what a templated one cannot
+
+The per-variable `title` and `summary` were trimmed out of the configs when the
+split wrote them onto each store, so a fresh build would have produced stores
+missing both. They are now derived from the variable's own `long_name`
+(`describe_variable`), because a config cannot reach into the netCDF attributes:
+a templated title could only say `Ep_aero` where a derived one says 'potential
+evaporation from the aerodynamic component'.
+
+`derive_attrs` was the obvious home and is the wrong one. Finalization calls it
+too, and derived values override what a store already holds, so putting the
+title there would rewrite the title of all 28 published stores the next time
+anyone ran `--attrs`. It lives apart, and only the build calls it. A store that
+has been published keeps the words it was published with.
+
+Prose that belongs to one variable rather than to the layout goes in a
+`variable_attrs` config section instead, keyed by variable; only `E` has any.
+Both were checked against the finished stores: the rendered `known_data_gaps` is
+byte-identical for every variable tested, so `--attrs` on the production stores
+stays a no-op, and the derived title matches the split's exactly, layout clause
+included.
+
+### 20. The login node kill, again
+
+The first fixture build was run on a login node and died at 14:26 with no
+traceback and no exit message -- the signature of an external kill, not a crash.
+It was a 2.4 GiB-per-batch build with four dask workers on a node at load 29
+with 61 users, which is precisely what the standing rule against heavy work on a
+login node exists to prevent.
+
+The same build in a `develop` job finished both variables in **under two
+minutes**, against five minutes *per batch* on the contended login node. That is
+the second time in this project that a login-node measurement has been wrong by
+more than an order of magnitude (finding 16 was the first). Treat a login node
+as a place to edit and inspect, and nothing else.
+
+### Outcome
+
+Both fixture layouts built from raw through the refactored pipeline and verified
+against the raw files: 19 checks, 0 failures per store. Resume was exercised
+three times over, twice by killing a run and once mid-job, and picked up from
+the last commit every time. The job script fans out one process per variable and
+its oversubscription guard now counts processes x workers rather than workers
+alone, reporting `num_workers=2 x 2 processes = 4, cpus available=8`.
+
+**The production stores were not rebuilt.** They are verified and tagged, and
+rebuilding 2 TiB to test a refactor would be the most expensive way to learn
+nothing. What a rebuild *would* write was checked instead, by rendering the
+attributes a production config produces against a built store.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been

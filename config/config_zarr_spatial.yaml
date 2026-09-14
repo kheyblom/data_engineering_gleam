@@ -17,7 +17,10 @@ chunks:
   lat: -1
   lon: -1
 timesteps_per_commit: 100
-num_workers: 4
+# one process per variable is the parallelism now, so a worker pool inside each
+# of 14 processes would oversubscribe the job; the job script refuses to launch
+# when processes x num_workers exceeds the cpus it holds
+num_workers: 1
 file_cache_maxsize: 32
 # the raw files are chunked 12 timesteps deep while the store is written one
 # timestep at a time, so this has to hold a whole 12 deep row of chunks (302 MiB)
@@ -71,3 +74,19 @@ attrs:
     approximate. Every absent chunk was traced to a raw plane that is entirely fill, so a chunk count below the timestep count is confirmed rather than assumed. The GLEAM component identities -- E against its six
     components, Ep against its two -- are checked from the store holding the
     total, which reads the component stores alongside it.
+
+# Attributes that belong to one variable rather than to the layout, keyed by
+# variable and merged over the shared ones above. Only E has any: its upstream
+# gap is a property of that variable, and a store must not carry a note about
+# data it does not hold.
+variable_attrs:
+  E:
+    known_data_gaps: >-
+      This variable is entirely fill (NaN) on 25 days -- five 5-day
+      blocks, 1982-02-05..02-09 and 1992-01-01..01-05, 03-21..03-25,
+      05-20..05-24 and 10-02..10-06 -- while every other GLEAM variable,
+      including E's own components, has data on those days. This is a
+      gap in upstream GLEAM {version_label}, not a conversion defect.
+      Zarr does not write a chunk whose cells are all fill, so this
+      store holds 16777 chunks against 16802 timesteps and that is
+      correct.
