@@ -4,6 +4,13 @@ Record of the testing run on **2026-09-09**, before the first production build
 of the v4.3a daily store. Written down because most of what it found was not
 what it went looking for.
 
+**This file is in chronological order, and the deliverable changed underneath
+it.** Sections up to *Finalization (2026-09-10)* describe a single store holding
+all 14 variables; the two all-variable stores were split into 28 per-variable
+ones on 2026-09-13 and deleted on 2026-09-14. Figures in the early sections are
+correct for what existed when they were written, not for what is on disk now.
+The later sections carry the current numbers.
+
 The pipeline had never been run to completion — `logs/` was empty and no store
 existed. The goal was to prove it worked end to end, and to choose
 `timesteps_per_commit`, `num_workers` and `file_cache_maxsize` from
@@ -65,7 +72,7 @@ and full `lat`/`lon` slab reads did not.
 - The **same** numpy 2.5.3 is clean on Python 3.13 and 3.12.
 
 **Fix:** `requires-python = ">=3.13,<3.14"`. Do not raise that cap without
-re-running `config/config_zarr_tiny.yaml`.
+re-running the tier 1 config (now `config/config_zarr_fixture_spatial.yaml`).
 
 ### 2. ~14x wasted decompression — the dominant cost
 
@@ -191,9 +198,9 @@ stale netCDF encoding surviving.
 | --- | --- |
 | `pyproject.toml` | `requires-python = ">=3.13,<3.14"` (finding 1) |
 | `utils/zarr_utils.py` | `chunk_cache_size_mib` applied in `configure_runtime` (finding 2) |
-| `config/config_zarr.yaml` | `chunk_cache_size_mib: 512`, `num_workers: 4` |
+| `config/config_zarr.yaml` (now `config_zarr_spatial.yaml`) | `chunk_cache_size_mib: 512`, `num_workers: 4` |
 | `submit_gleam_zarr.sh` | `QUEUE`/`NCPUS`/`MEM`/`WALLTIME`/`AFTER` overrides; affinity-based guard (finding 6) |
-| `config/config_zarr_tiny.yaml` | new — tier 1 config against a staged tree |
+| `config/config_zarr_tiny.yaml` | new — tier 1 config against a staged tree (superseded 2026-09-14 by the fixture configs) |
 | `config/config_zarr_bench.yaml` | new — throwaway store for timing runs |
 | `CLAUDE.md`, `README.md` | corrected chunk figures, documented the new key and the guard |
 
@@ -508,6 +515,509 @@ change, reachable bytes and history length, and exits non-zero if either moves.
 That check is the whole reason it was comfortable to run an irreversible
 operation on a store with no second copy — that, and the rehearsal above.
 
+## Building the temporal store (2026-09-11)
+
+Record of the testing for the **second** store, chunked
+`(time, lat, lon) = (16802, 20, 20)` for time-series reads, built from the same
+raw files by the new `region` write strategy. Same tiered method as 2026-09-09
+and for the same reason; what it found was again not what it went looking for.
+
+The two findings below are both cases where the volume of data moved was
+identical and the cost was not. Neither is visible in a profile of the pipeline
+— one is a property of how the source files are laid out, the other of how dask
+assembles an array — and neither shows up on a small or sparse test fixture.
+
+### 11. A block narrower than the globe reads the file strided, not sequentially
+
+The obvious way to bound the memory a region block takes is to shrink it in both
+lat and lon. That is wrong, and it is wrong for a reason that volume arithmetic
+cannot see.
+
+The raw files are chunked `[12, 57, 113]`. A block spanning all of lon touches
+every lon chunk, so each `(time chunk, lat chunk)` pair is read as one
+contiguous run of 32 source chunks. A block half as wide touches 11 of every 32,
+**scattered through the file**, and the same bytes then arrive as several times
+as many seeks.
+
+Measured on one `E` year file, cold, 512 MiB chunk cache:
+
+| read | wall | volume | rate |
+| --- | --- | --- | --- |
+| `[:, 0:600, 0:1200]` strided in lon | 29.4 s | 0.98 GiB | **34.2 MiB/s** |
+| `[:, 0:600, :]` full lon | 29.7 s | 2.95 GiB | **101.7 MiB/s** |
+| `[0:67, :, :]` whole planes, for reference | 10.9 s | 1.62 GiB | 151.4 MiB/s |
+
+3.0x for the same bytes, purely from locality. (A fourth row, `[:, 0:200, :]` at
+341.7 MiB/s, is not evidence — that band was already in page cache from the two
+reads above it. It is left out of the conclusion.)
+
+**How it was nearly missed.** The shape was first tried at `600 x 1200` on `Ec`,
+which compresses about 70:1 and finished in seconds per block. On `E`, which
+compresses about 3.4:1, the same shape sat at **9% cpu with no block committed
+in eleven minutes**. The fixture was not small, it was *sparse*, and a sparse
+variable barely touches the disk. **Test a read-pattern change on the dense
+variable.** And when a rechunk looks slow, read cpu% first: 9% says locality,
+not codec.
+
+`block_shape.lon` is now required to be `-1`, and the cost of the block is paid
+in lat alone: `lat: 200` is 45.1 GiB resident against 1.43x read amplification,
+which is the right trade when Derecho bills cpus and not memory.
+
+### 12. `.load()` doubles a block at the moment it comes together
+
+With the block shape fixed, the tier-2 bench still died — on its **first block**,
+after 59 minutes, with `RuntimeError: NetCDF: HDF error`.
+
+That error is a red herring twice over. It is not an HDF5 defect, and it is not
+really about netCDF at all. The tell is in the timings: **46 minutes of system
+time against 2 minutes of user**. A process that spends 95% of itself in the
+kernel is not computing, it is being ground through page reclaim against a
+memory cgroup, and the allocation that finally fails is simply whichever one
+came next — here, one inside HDF5, which reports it uninformatively.
+
+The budget against the job's 96 GB:
+
+| | |
+| --- | --- |
+| HDF5 chunk caches, 46 open files x 512 MiB | 23.6 GB |
+| block buffer | 48.4 GB |
+| dask holding all 46 inputs *and* allocating the concatenated output | +48.4 GB |
+| **total** | **~120 GB** |
+
+`.load()` is the obvious way to materialise a block and the wrong one at this
+size: dask holds every input chunk while it allocates the output beside them, so
+a 45 GiB block is transiently 90 GiB with nothing in the log to say so.
+`read_into_buffer` fills one preallocated array a time chunk at a time instead.
+The chunk boundaries are the file boundaries, so every read is still a single
+contiguous hyperslab out of one file, and peak memory becomes the block plus one
+slab.
+
+`chunk_cache_size_mib` was the second term, and it was inherited rather than
+chosen: 512 is the 7.6x lever on the `append` path, where the store is written
+one timestep at a time out of twelve-deep source chunks. On the `region` path it
+is not doing that job — a block is one hyperslab and every source chunk it
+touches is decompressed once regardless — but it still multiplies by the open
+file count, and a region job holds all 46 files of a variable open. At 64 MiB it
+costs 2.9 GB.
+
+Projected peak falls from ~120 GB to **49 GiB**. The append-path configs keep
+512, where it is still worth 7.6x.
+
+**The generalisation worth keeping:** on the append path peak memory is the
+chunks in flight, and `configure_runtime` bounds it. On the region path peak
+memory *is the block*, and the two settings that used to be the memory story are
+now minor next to it. The strategies do not share a cost model, and a setting
+carried from one to the other should be re-derived, not inherited.
+
+### Tier 2 outcome: Ep, all 46 years (job 7403373, 2026-09-11)
+
+Nine blocks, 0.40 TiB logical, **137 min**, exit 0. Tier 1 rebuilt and verified
+clean in the same job (27 checks, 0 failures).
+
+| | |
+| --- | --- |
+| per block (45.1 GiB logical) | 11.4 - 19.6 min, mean 15.2 |
+| throughput | 0.0455 GiB/s logical |
+| spatial build, for comparison | 0.111 GiB/s |
+| cpu actually used | **0.47 cores**, while billing 2 |
+| `Ep` compressed | **123 GiB**, against 123.8 GiB for the same variable in the spatial store |
+
+**The region path is 2.4x slower per logical byte than the append path**, and
+that is explained rather than mysterious: 1.43x read amplification from the lat
+band, times 1.49x worse locality than a whole-plane read (101.7 against
+151.4 MiB/s in the finding 11 probe). 1.43 x 1.49 = 2.13, near enough.
+
+**The layout buys no space.** 123 GiB against 123.8 GiB for the same variable.
+The ocean tiles that vanish entirely here were already compressing to almost
+nothing in the spatial store, so the saving that looked available from the chunk
+counts -- 43% of the grid written on the tiny fixture -- is not a saving in
+bytes. Budget the finished temporal store at ~1.03 TiB, the same as its sibling.
+
+### Sizing the production chain from two runs
+
+Cost was fitted as `a x (raw bytes decompressed) + b x (logical bytes written)`
+against the two full-scale runs there are -- the spatial production build
+(1097 GB raw, 5686 GB logical, 14.2 h) and this bench (127 GB raw x 1.43, 406 GB
+logical, 2.29 h):
+
+    a = 12.3 h per TB decompressed      b = 0.12 h per TB written
+
+Decompressing the raw files is ~97% of it, which is why scaling by *logical*
+volume overestimates so badly: the 14 variables are identical in logical size
+but range from 6.2 GB to 128 GB of raw bytes, and the sparse ones are nearly
+free. Pure logical scaling says 32 h; the fit says **20 h**.
+
+| lat band | read amplification | projected wall | core-hours at ncpus=1 |
+| --- | --- | --- | --- |
+| 200 (benched) | 1.43x | 20.0 h | 20.0 |
+| 360 | 1.27x | 17.9 h | 17.9 |
+| 600 | 1.14x | 16.1 h | 16.1 |
+
+### 13. `Used Mem` in qhist is not peak RSS
+
+The bench reported `Used Mem = 96.00000381469727` against a `mem=96GB` request,
+which reads like the job pressing against its ceiling. It is not. The cgroup
+counter includes reclaimable page cache, which a job reading a terabyte of
+netCDF fills to the limit as a matter of course. The same column reads exactly
+`32.0` for the 2026-09-09 production jobs, whose real high-water was 16.8 GB.
+
+The number is only diagnostic when a job **fails**: job 7401899 died reporting
+66.13 GB against the same 96 GB cap, and that is the tell -- not that it reached
+the cap, but that it did not, because the allocation that was refused (a ~48 GB
+concatenation buffer on top of 66 GB already resident) never became resident to
+be counted. Read it with the sys/user ratio beside it: 78% of wall in system
+time for the failed run against 18% for the healthy one.
+
+## Verifying and finalizing the temporal store (2026-09-13)
+
+The store finished at 05:59 on 2026-09-13, 126 of 126 blocks over a chain of
+eight `cpudev` jobs. Verification ran on a login node in two invocations rather
+than one, because the sweep alone takes an hour here and there is no reason to
+pay for it twice:
+
+```bash
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --phases structure,sweep                       # 103 checks, 0 failures, 61 min
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --phases index,samples,identities,ranges,metadata \
+    --compare-with config/config_zarr_spatial.yaml # 49 checks, 0 failures, 64 min
+```
+
+**152 checks, 0 failures.** 1.003 TiB compressed across 95,467 chunks, 0.181 of
+logical; 56 boxes (376.4M cells) bit-identical to raw on the right days; both
+component identities closing at all four sampled positions; `time`, `lat` and
+`lon` bit-identical to raw and to the sibling store.
+
+The one non-closing identity is the same upstream property the spatial store
+recorded: `Ep != Ep_aero + Ep_rad` on 76 cells of one tile (0.0012%), where the
+store reproduces raw exactly. Not a conversion defect, and checked rather than
+assumed.
+
+### 14. A temporal draw over this grid is mostly ocean, and silence read as success
+
+`identities` and `ranges` drew their positions uniformly from the 90x180 tile
+grid, of which roughly 58% is ocean. An all-fill position has no identity to
+close and no bound to check, so `check_identities` skipped it — recording no
+check at all — and `check_ranges` passed vacuously on `observed [nan, nan]`.
+With `--identity-days 4` an all-ocean draw is perfectly plausible, and the run
+would have reported success having tested nothing. Nothing was wrong with the
+store; the phases could not have found it if there had been.
+
+Fixed in two halves, because either alone leaves the hole open. The draw is now
+stratified on land (`sample_spots` alternates fully covered and coastal tiles,
+from the same footprint `sample_boxes` already computed), and both phases now
+record whether they found data at all — `identity tested somewhere that holds
+data`, `at least one sampled box holds data`. A draw that finds nothing is now a
+finding rather than a silence. Measured after: 4 of 4 identity positions and 6
+of 6 range boxes hold data, for all 14 variables.
+
+### 15. The variables audit each other's absent tiles
+
+An absent chunk is justified against a handful of sampled raw planes, which
+cannot see a tile holding data only on an unsampled day. Reading all ~9,400
+absent tiles of a variable end to end would settle it and costs about a minute
+each, so it is not affordable; but the variables share a land mask closely
+enough that the interesting holes are few. Ten of the fourteen have tiles that
+*another* variable wrote and they did not — 226 each for `E`, `Ei`, `Ep`,
+`Ep_aero`, `Ew`, `H` and `S`, 149 for `Ep_rad`, 240 for each soil moisture,
+2211 in all — which is the known GLEAM footprint difference, the components
+being finite on some cells where `E` is NaN. `trace_absent_tiles` spends a
+shared budget (`--trace-absent`, 24) on exactly those, reading each from raw
+across all 16802 timesteps. Every one traced was genuinely empty. That is a
+proof for the tiles most likely to hide a loss, at 20 reads against the 131,333
+absent tiles a full audit would mean.
+
+### Finalization, and why there is no tag
+
+`--attrs --apply` added `verification` and corrected two attributes the config
+had guessed ahead of the build: `history` (it said 2026-09-11; the build ran
+2026-09-12/13 as 126 block commits) and `date_created` (a bare date, against the
+sibling's ISO 8601 UTC; the build spans two days, so a bare date is ambiguous).
+
+**Garbage collection found nothing to collect: 0 bytes, 0 chunks, 0 snapshots.**
+That is the region path, and it is worth contrasting with finding 9. The append
+build accumulated 171 fork snapshots because every `to_icechunk` write forks the
+session; the region build's 128 snapshots are exactly 126 blocks plus the
+skeleton plus the initial one, with no surplus at all. A store on this path has
+no routine cleanup to do.
+
+The post-collection gate re-audited every chunk off the manifest with the raw
+comparisons turned down (`--mask-days 1 --smallest 0 --trace-absent 0`), since
+what collection could damage is the manifest and the chunks, not the agreement
+between a chunk and a file that collection never touched: **89 checks, 0
+failures in 12 minutes**, 95467 chunks and 1.003 TiB both unchanged. The full
+depth version of the same phases had already run before collection, and
+collection deleted nothing, so paying an hour to re-read raw would have proven
+only that raw had not changed.
+
+Final state: 30 attributes, 129 snapshots all reachable, 0 unreachable objects.
+`--status` ends with `remaining --tag NAME`, which is the script offering the
+step this store deliberately does not take.
+
+The tier-2 bench store (`bench_temporal`, 123 GB) was deleted after this, as
+`config/config_zarr_bench_temporal.yaml` says to do once tier 2 is recorded.
+
+**No tag.** The convention is `<version>-verified-<YYYYMMDD>` and the spatial
+store carries one, but tags are immutable, and this store is an interim artifact:
+it is to be replaced by one store per variable. Tagging it would permanently name
+something not meant to be cited. The verification is recorded in the store's own
+attributes instead, which a later split can carry forward.
+
+## Splitting into per-variable stores, and verifying them (2026-09-14)
+
+The deliverable changed to one store per variable. Both all-variable stores were
+split into 14 stores each and all 28 were verified against raw and finalized.
+
+### The split: 17 core-hours per layout, not 85
+
+Copying from the finished stores rather than rebuilding from raw skips the
+netCDF decompression that the cost fit puts at ~97% of a build. Fourteen
+processes, one per variable, on `develop` at `ncpus=14`: **73 min for the
+temporal layout, 98 for the spatial**, against ~85 core-hours to rebuild both
+from the netCDF files. The per-variable stores are separate repositories, so the
+single-writer rule that forces a build into a chained job does not apply and the
+variables run in parallel with no coordination at all.
+
+### 16. Copying stored chunk bytes does not work
+
+The first attempt copied chunks as *stored bytes* through the zarr store API --
+same chunk grid, same codecs, so nothing would be decoded and every chunk would
+be bit-identical by construction. It is the obviously cheaper design and it does
+not survive contact with icechunk:
+
+| chunks copied | rate |
+| --- | --- |
+| first 2000 | 202/s |
+| next 2000 | 41/s |
+| next 2000 | 18/s |
+
+The rate collapses as the destination grows, whether the writes are committed in
+one session or in batches of 2000, because every commit rewrites a manifest
+holding every chunk reference written so far. A later run failed outright with
+`RepositoryNotFoundError` mid-commit. Going through the pipeline's own write
+path costs a decode and a re-encode per chunk and holds a steady rate, which is
+the only thing that matters at 2 TiB.
+
+Worth knowing for the same reason finding 9 was: **a first measurement on a
+login node can be 30x pessimistic.** The early figures here were taken at load
+59 with 40 users; the same code on a batch node ran at 177 MB/s per process,
+4.5 GiB blocks in 26 s.
+
+### 17. One variable per store strands two checks
+
+The component identity and the cross-variable absent-tile trace both read more
+than one variable, and the split leaves each store with one. The trace is the
+one with no substitute: it is what proves an absent chunk is empty across the
+whole record, and finding 15 added it precisely because the sampled planes
+cannot see a tile that holds data only on an unsampled day.
+
+Both were ported to read sibling stores, which the filename template makes cheap
+-- a sibling's path is the same template rendered with a different variable, so
+there is no second naming convention to keep in step. The trace takes its union
+from 13 sibling *manifests*, which is metadata only and costs about a second.
+The identity runs only from the store holding the total, so it is checked twice
+across the family rather than fourteen times.
+
+The split also multiplies what the same settings buy. `--trace-absent 24` was a
+budget shared over 10 variables in one store; per-variable it is 24 per store,
+so **240 whole-record traces against 20**. The temporal draw was cut to
+`--samples 12` to pay for that and still gives ~3x the all-variable coverage.
+
+### Verification and finalization outcome
+
+All 28 stores: **0 failures**, 26-33 checks per spatial store and 28-34 per
+temporal one (the `E` and `Ep` stores carry the extra identity checks). Two jobs
+of 14 processes, ~25 min wall each.
+
+The `Ep != Ep_aero + Ep_rad` non-closure on 76 cells of one tile reappeared
+exactly as the all-variable stores recorded it, now read across three separate
+stores, with the store still reproducing raw bit-for-bit.
+
+Then attrs, tag `v4.3a-verified-20260914`, and gc on each store. **The garbage
+collection is the cleanest measurement yet of what the two write strategies
+cost in litter:**
+
+| | per spatial store | per temporal store |
+| --- | --- | --- |
+| orphan snapshots | 169 | 0 |
+| orphan manifests | 507 | 0 |
+| orphan transaction logs | 169 | 0 |
+| chunks, bytes | 0, 0.00 GiB | 0, 0.00 GiB |
+
+One orphan snapshot per `to_icechunk` append commit, exactly as the append path
+produces them and the region path does not. **Zero chunks and zero bytes on
+every store** is the number that matters before an irreversible step: the
+collection could only ever have removed metadata. Every store then passed a
+re-audit of its whole manifest, and a second collection found nothing.
+
+### The all-variable stores are gone
+
+Deleted 2026-09-14, ~2.2 T, once all 28 per-variable stores had been verified
+against raw, tagged and collected -- and once reading a per-variable store
+through its tag had been shown to work with the originals still in place. The
+order matters: the split stores were never derived from a running original, so
+nothing depended on them, but that is worth demonstrating rather than assuming
+before an irreversible delete.
+
+The configs stopped addressing them a commit earlier, which is its own small
+safeguard: after the template gained `{variable}`, no config could render the
+path of an all-variable store even by accident.
+
+## Refactoring the pipeline to build per-variable stores (2026-09-14)
+
+`gleam_zarr.py` still merged every variable into one store, so the pipeline
+could not reproduce what was on disk -- the only thing that had ever produced
+the per-variable layout was a one-off script, since deleted. A build now writes
+one variable per store, `--variable` picks which, and omitting it builds the
+layout's family one at a time.
+
+### 18. Deleting the merge deletes a check
+
+`merge_variables` was not only a merge: it refused to proceed unless every
+variable covered identical timesteps, because a partial download would
+otherwise surface as a silently NaN-filled variable. With one variable per
+store there is no merge left to notice.
+
+`check_time_axis` replaces it by comparing each variable against the family's
+**first**, read from the netCDF headers rather than by opening data. Each of the
+14 builds checks itself against the same reference, which pins the family
+collectively without any build knowing about the others, and costs one pass over
+46 file headers.
+
+A guard nobody has watched fail is not known to work, so it was made to fail: a
+staged tree with `Ec` one year short raised
+
+```
+ValueError: variable 'Ec' has 366 timesteps that do not match 'E' with 731;
+the download may be incomplete
+```
+
+and **no zarr directory was created** -- it stops before writing, which is the
+whole point.
+
+### 19. A derived title says what a templated one cannot
+
+The per-variable `title` and `summary` were trimmed out of the configs when the
+split wrote them onto each store, so a fresh build would have produced stores
+missing both. They are now derived from the variable's own `long_name`
+(`describe_variable`), because a config cannot reach into the netCDF attributes:
+a templated title could only say `Ep_aero` where a derived one says 'potential
+evaporation from the aerodynamic component'.
+
+`derive_attrs` was the obvious home and is the wrong one. Finalization calls it
+too, and derived values override what a store already holds, so putting the
+title there would rewrite the title of all 28 published stores the next time
+anyone ran `--attrs`. It lives apart, and only the build calls it. A store that
+has been published keeps the words it was published with.
+
+Prose that belongs to one variable rather than to the layout goes in a
+`variable_attrs` config section instead, keyed by variable; only `E` has any.
+Both were checked against the finished stores: the rendered `known_data_gaps` is
+byte-identical for every variable tested, so `--attrs` on the production stores
+stays a no-op, and the derived title matches the split's exactly, layout clause
+included.
+
+### 20. The login node kill, again
+
+The first fixture build was run on a login node and died at 14:26 with no
+traceback and no exit message -- the signature of an external kill, not a crash.
+It was a 2.4 GiB-per-batch build with four dask workers on a node at load 29
+with 61 users, which is precisely what the standing rule against heavy work on a
+login node exists to prevent.
+
+The same build in a `develop` job finished both variables in **under two
+minutes**, against five minutes *per batch* on the contended login node. That is
+the second time in this project that a login-node measurement has been wrong by
+more than an order of magnitude (finding 16 was the first). Treat a login node
+as a place to edit and inspect, and nothing else.
+
+### Outcome
+
+Both fixture layouts built from raw through the refactored pipeline and verified
+against the raw files: 19 checks, 0 failures per store. Resume was exercised
+three times over, twice by killing a run and once mid-job, and picked up from
+the last commit every time. The job script fans out one process per variable and
+its oversubscription guard now counts processes x workers rather than workers
+alone, reporting `num_workers=2 x 2 processes = 4, cpus available=8`.
+
+**The production stores were not rebuilt.** They are verified and tagged, and
+rebuilding 2 TiB to test a refactor would be the most expensive way to learn
+nothing. What a rebuild *would* write was checked instead, by rendering the
+attributes a production config produces against a built store.
+
+## A repeatable test (2026-09-14)
+
+Everything above was checked by hand, which catches nothing later.
+`validation/test_pipeline.py` runs the same ground in about two minutes: it
+builds both layouts from a fixture, verifies all eight stores against raw, and
+exercises the guards. 18 cases, non-zero exit on any failure.
+
+### 21. A faithful fixture nobody runs is worth less than a small one
+
+Tier 1 used to be symlinks to whole year files at the full 1800x3600 grid,
+staged by a script that was never committed -- so the fixture could not be
+recreated from the repo, and its config comments had drifted from the tree they
+described (they claimed E and SMs at 366 timesteps; the tree held E and Ec at
+731).
+
+`validation/stage_fixture.py` replaces it by subsetting the real files: four
+variables, two years, a 100 x 200 window, 72 MB, staged in under a minute and
+byte-identical to the source window with every attribute, the -999 sentinel and
+the 12-deep time chunking preserved. Three choices in it are load-bearing:
+
+- **The window holds land and ocean** (48% land, around 40N..30N by 0..20E).
+  An all-land window never leaves an ocean tile absent, and absent tiles are
+  much of what there is to check.
+- **100 x 200 is a whole number of 20 x 20 chunks.** The verifier skips its
+  absent-chunk checks outright when the grid is not, so the wrong window would
+  have produced a fixture that silently skipped the checks it exists for.
+- **Ep, Ep_aero and Ep_rad** make the component identity checkable *across*
+  sibling stores, and `E` is present as a total whose components are not, which
+  is the case that has to skip gracefully rather than fail.
+
+### 22. The test found two real bugs on its first run
+
+Both were invisible to every check run by hand, and both are the kind that only
+a second scale or a second reader exposes.
+
+**The degenerate-chunk floor was a statement about one grid.** `DEGENERATE_BYTES`
+was a flat 50 KiB, calibrated as "a global float32 plane never zstds below
+this". On the 100 x 200 fixture a perfectly good chunk is 33 KB, so the check
+cried damage on a correct store. It is now a *fraction* of the chunk's logical
+size, 0.2%, which is the same 50.6 KiB on the production grid and scales
+everywhere else. Re-checked against a production store: same verdict, same
+numbers.
+
+**The cross-store identity note was dead code.** It was written as
+
+```python
+if sources[total_name] is not dataset:      # never true
+```
+
+but the total always comes from the store under test -- what makes the read
+cross-store is the *components*. The note never fired, so the log said nothing
+about a check that was in fact running. Caught only because the test asserts on
+what a run reports, not merely on its exit status: a phase that silently checks
+nothing exits 0 just as happily as one that works.
+
+### 23. Proving a test can fail is part of writing it
+
+The first deliberate break -- downgrading `check_time_axis`'s size branch from a
+raise to a warning -- did not turn the test red, and that was correct: the
+second branch still raised, the build still refused, and nothing was written.
+The test asserts behaviour rather than internals, so it passed because the
+behaviour was still right.
+
+Disabling the guard outright did turn it red, on exactly the right case and with
+a message that says what went wrong:
+
+```
+FAIL  a short variable raises before anything is written  exit 0, no store created: False
+```
+
+The same reasoning as the guard in finding 20: a check nobody has watched fail
+is not known to work.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
@@ -523,19 +1033,21 @@ operation on a store with no second copy — that, and the rehearsal above.
   if wallclock ever becomes the binding constraint.
 - ~~**The 8.57 GiB of orphaned chunks was left in place.**~~ **Done
   2026-09-10**, and the reasoning that deferred it was wrong. See finding 9.
-- **The store lives on scratch, which is purged.** 1.041 TiB sitting in
-  `/glade/derecho/scratch` is subject to the purge policy; the campaign
-  allocation `/glade/campaign/univ/umic0112` has 5 TiB free and 0 used.
-  **Accepted, 2026-09-10**: the store stays on scratch for now and the move is
-  handled separately. `directories.raw` was added so a moved store can still be
-  verified against a raw tree that did not move with it, which is the coupling
-  the move runs into first. Until it moves, treat the store as reproducible
-  rather than archived.
-- **`chunks: {time: 1}` is the worst possible layout for point time-series
-  reads**, which touch all 16802 chunks of a variable. Correct for the
-  `spatial` store; if that access pattern matters downstream it wants a second,
-  time-chunked store rather than a change here. Now recorded in the store's own
-  `chunking` attribute, so a consumer does not have to discover it.
+- **The stores live on scratch, which is purged.** Written when this was one
+  store of 1.041 TiB; it is now **28 stores totalling ~2.1 T**, beside ~1.7 TiB
+  of raw, all still on `/glade/derecho/scratch` and all still subject to the
+  purge policy. **Accepted, 2026-09-10 and again 2026-09-14**: the stores stay
+  on scratch, and a copy is taken to `/glade/campaign/univ/umic0112` as a backup
+  rather than moving them. `directories.raw` exists so a store read from
+  somewhere else can still be verified against a raw tree that did not move with
+  it, which is the coupling any move runs into first.
+- ~~**`chunks: {time: 1}` is the worst possible layout for point time-series
+  reads**, which touch all 16802 chunks of a variable.~~ **Being addressed
+  2026-09-11**: a second store chunked `(16802, 20, 20)` is built beside it
+  rather than changing this one, which stays correct for maps. See *Building
+  the temporal store*. Both layouts are recorded in their stores' own
+  `chunking` attributes, each pointing at the other, so a consumer does not
+  have to discover either.
 - **The store is not CF compliant, and is not claimed to be.** Each variable's
   `standard_name` and `units` come through unaltered from upstream, so the
   standard names are descriptive strings and the units (`mm.day-1`, `m3.m-3`)
@@ -555,7 +1067,7 @@ are, and both isolate their store by path, so neither can touch production:
 
 ```bash
 # tier 1: stage 2 variables x 1 year as symlinks, then build to completion
-uv run python gleam_zarr.py --config config/config_zarr_tiny.yaml
+uv run python gleam_zarr.py --config config/config_zarr_fixture_spatial.yaml
 
 # tier 3a: real input, throwaway store under a 'bench' suffix
 uv run python gleam_zarr.py --config config/config_zarr_bench.yaml
@@ -569,17 +1081,23 @@ seconds, which makes it a reasonable smoke test after any change to the
 encoding or chunking logic:
 
 ```bash
-# everything: ~10 minutes on a login node, one core, free
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
+# everything, for one store of a layout: ~10-15 minutes on a login node, free.
+# The config names the layout; --variable names the store within it
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E
 
 # the metadata-only phases: seconds, and the sweep is the only full-coverage
 # check there is -- run this first after any rebuild
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
-    --phases structure,index,sweep
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E --phases structure,index,sweep
 
 # spend longer on value comparisons
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
-    --phases samples --samples 140 --seed 1
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E --phases samples --samples 140 --seed 1
+
+# the two layouts of one variable, held to describing the same data the same way
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E --phases metadata --compare-with config/config_zarr_spatial.yaml
 ```
 
 It exits non-zero if any check fails, and writes to
@@ -588,8 +1106,10 @@ It exits non-zero if any check fails, and writes to
 Finalization is separate, and writes nothing without `--apply`:
 
 ```bash
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
+uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E --gc
 ```
 
 Run either without `--apply` first — the output is exactly what the applied run

@@ -4,32 +4,66 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Converts raw GLEAM (evaporation/soil moisture) netCDF files into a single
-icechunk-backed zarr store on NCAR Derecho/GLADE. One script, one config, no
-package install step — `gleam_zarr.py` is run directly from the repo root.
+Converts raw GLEAM (evaporation/soil moisture) netCDF files into icechunk-backed
+zarr stores on NCAR Derecho/GLADE. One script, one config per layout, no package
+install step — `gleam_zarr.py` is run directly from the repo root.
+
+The deliverable is **28 stores: one per variable, under each of two chunkings**
+— `spatial` (`1, 1800, 3600`, one global map per chunk) and `temporal`
+(`16802, 20, 20`, one 2x2 degree tile through the whole record). The layout is
+the directory, the variable is the filename, and one config addresses a whole
+layout with `--variable` picking the store within it.
+
+The two layouts are not derived from each other: each was built from raw and
+verified against raw independently, so nothing about one has to be trusted to
+trust the other. The per-variable stores were split from two all-variable stores
+-- deleted 2026-09-14, once all 28 had been verified against raw in their own
+right -- so the split is not trusted either.
 
 ## Commands
 
 ```bash
 uv sync                                             # create/refresh .venv from uv.lock
-uv run python gleam_zarr.py --config config/config_zarr.yaml
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
+uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E                                    # omit to build all 14
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E                                    # one store of the layout
 
 # finalization; writes nothing without --apply, one action per invocation.
 # --status first: it reports which steps a store still needs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --tag NAME
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E --status
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --tag NAME
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --gc
 ```
 
-There is no test suite, linter, or CI configured; the
+There is an end to end test, `validation/test_pipeline.py`, which runs on a
+miniature fixture (`validation/stage_fixture.py` subsets the real raw files to a
+100x200 window) in about two minutes on a login node, spending no allocation.
+Run it after changing anything in the pipeline. There is no linter or CI; the
 notebook [draft_zarr.ipynb](draft_zarr.ipynb) is exploratory scratch work, not
 part of the pipeline. `verify_gleam_zarr.py` audits a *finished* store against
-the raw files — six phases selectable with `--phases`, read only throughout,
-non-zero exit on any failure. Its `sweep` phase is the only full-coverage check
-available: it audits all 235,228 chunks off the manifest in ~30 s without
-reading data, so it is the thing to run first after any rebuild.
+the raw files — seven phases selectable with `--phases`, read only throughout,
+non-zero exit on any failure. Six run by default; `metadata` compares the
+store's attributes and coordinates against a sibling store's and needs
+`--compare-with <config>`, which is how two stores built from the same files
+are held to describing the same data the same way. `--variable` picks which
+store of a layout to check, and the config's variable list then names the
+*family*: the two checks that need more than one variable — the GLEAM component
+identities and the absent-tile trace — read the sibling per-variable stores
+rather than dying with the split. Only the store holding a total runs that
+identity, so the check is not repeated fourteen times.
+
+It reads the store's chunking
+and follows it: the unit of comparison is a *box* that is one chunk of the store,
+a global plane in the spatial store and a 20x20 tile through the whole record in
+the temporal one. Reading the other layout's box is not a style question — one
+global plane out of the temporal store touches every chunk of the variable,
+~400 GiB, to return one map. Its `sweep` phase is the only full-coverage check
+available: it audits every chunk off the manifest in ~30 s without reading data
+(235,228 of them in the spatial store), so it is the thing to run first after
+any rebuild.
 [TESTING.md](TESTING.md) records how the pipeline was
 validated and tuned before the first production build, including the two test
 configs that reproduce it, the reasons behind the execution settings, and the
@@ -72,7 +106,17 @@ name carries the same directory spelling. `variables: all` expands against the
 directories actually present under `raw/<temporal_resolution>/`, and a
 config-listed variable with no directory is an error rather than a skip.
 
-### Incremental write model
+### Two write strategies
+
+`write_strategy` in the config picks how a store is filled, and it must match
+the chunking: `resolve_write_strategy` raises on a mismatch rather than letting
+it through, because **both mismatches fail quietly**. An `append` build of a
+store whose time chunk spans the record silently collapses into one batch and
+one commit — `commit_batch_size` rounds the target up to a whole chunk — so a
+walltime kill loses the entire run and the `afterany` chain restarts from zero
+forever. A `region` build of a shallowly chunked store merely wastes memory.
+
+### Incremental write model: `append`
 
 The dataset is assembled lazily, then pushed out in batches of timesteps, each
 committed to the icechunk repo before the next starts, so an interrupted run
@@ -104,11 +148,75 @@ Constraints that hold this together — breaking any of them breaks resume:
 - Time encoding (`days since 1900-01-01`, proleptic_gregorian, int64) is pinned
   so every appended batch encodes identically.
 
+### Incremental write model: `region`
+
+A store chunked along the whole time axis has no append boundary — every chunk
+spans every timestep — so it is built the other way round: `create_skeleton`
+writes the group, the array metadata and the coordinates with `compute=False`
+(no data chunk at all), and `write_by_region` then fills the arrays in place,
+one lat/lon block of the full record at a time, committing each.
+
+- A block is read whole into memory, so **peak memory here is the block**, not
+  the chunks in flight. That is the opposite of the append path and the reason
+  a region job asks for memory rather than cpus.
+- `block_shape` is deliberately far larger than the output chunk. The raw files
+  are chunked `[12, 57, 113]`, so a block only 20 cells wide would decompress
+  each 57x113 source chunk once per tile it covers — 3.8x at a 20-row block
+  against 1.43x at `lat: 200`. Memory is not billed on Derecho and read
+  amplification is, so the block buys one down with the other.
+- **`block_shape.lon` must be -1.** Volume is not the whole story: a block
+  narrower than the globe reads a *strided* subset of the source chunks — 11 of
+  every 32 along lon, scattered through the file — instead of contiguous runs of
+  32. A 600x1200 block measured 9% cpu and no committed block in eleven minutes
+  on `E`, against seconds per block on the sparse `Ec` that the shape was first
+  tried on. Same bytes, different locality. Full lon makes every read a
+  contiguous run and costs only more resident memory, which is free here.
+- `block_shape` must be a whole number of output chunks, or a region write would
+  land mid-chunk and force zarr to read, patch and rewrite chunks the next block
+  also touches.
+- Resume state is the set of blocks already committed, parsed back out of the
+  **commit messages** by `committed_blocks` (`BLOCK_MESSAGE` and
+  `BLOCK_MESSAGE_RE` have to stay in step). It lives in the history rather than
+  in the store so that resuming needs nothing but the ancestry icechunk keeps
+  anyway, and so `finalize_gleam_zarr.py --attrs` does not have to strip build
+  bookkeeping out of the attributes it publishes.
+- Changing `block_shape` between runs is safe but wasteful — no committed block
+  matches the new grid, so all of it is written again. The run warns and
+  continues; coverage is still complete because every block not in `done` is
+  written.
+- **The 14 temporal stores on disk are in that state already.** They were split
+  out in 20-row blocks, because 14 concurrent processes cannot each hold the
+  48 GB a 200-row block needs, while the config asks for `lat: 200` because that
+  is the right trade against the *raw* files (1.43x read amplification against
+  3.8x at 20 rows). Both were right for their job; neither matches the other. So
+  a rebuild of a temporal store resumes nothing and rewrites all 9 blocks —
+  ~2.5 h per variable. Do not read "region resume" as "a rerun is free" the way
+  it is on the append path, where resume is by timestep count and a finished
+  store really is a no-op.
+- `gleam_zarr.py` **refuses to build into a store that carries a tag** unless
+  `--force` is passed. A tag is how a finished store is published here, and the
+  damage from rebuilding one is not to the data — the same values are written
+  and the tag is immutable — but to the store's honesty: the branch tip would
+  carry a `verification` attribute earned by a snapshot that is no longer the
+  tip.
+- In the temporal layout a **large fraction of the chunk grid is legitimately
+  absent**: a 20x20 tile that is ocean is all-fill for all 16802 timesteps, and
+  zarr does not write it. Unlike the spatial store's 25 missing `E` chunks, this
+  is the common case rather than the exception, and it is not per-timestep — E's
+  all-fill days fall inside chunks that also hold valid days, so they leave no
+  hole at all here. No affordable read confirms 9,000 holes exhaustively, so the
+  verifier checks them in the direction that matters (every tile holding data on
+  a sampled raw plane was written) and then settles the interesting ones
+  outright: a tile some *other* variable wrote is read from raw across the whole
+  record, which proves that hole rather than sampling it.
+
 ### Execution settings
 
 `num_workers` and `file_cache_maxsize` are the two config keys that change what
 a run costs rather than what it produces; both are optional and fall back to the
-library default when unset. They are applied by `configure_runtime` before
+library default when unset. (`block_shape` changes cost too, but it is not
+optional on the region path and it sets the resume granularity as well, so it is
+documented with that strategy above.) They are applied by `configure_runtime` before
 anything opens a file, since neither takes effect retroactively, and the
 resolved values are logged so a job killed for running out of memory can be read
 back against what it actually used.
@@ -118,15 +226,18 @@ the job script checks this against the affinity mask, not `$NCPUS` or `nproc`:
 on a shared develop node PBS reports `NCPUS=1` whatever it granted, and `nproc`
 reports `OMP_NUM_THREADS`, which the script pins to 1. Left unset, dask sizes
 its pool from the cpuset instead. `file_cache_maxsize` only has to cover the
-files a single batch touches (two year files per variable at most), so it is set
-well below xarray's default of 128.
+files a single unit of work touches — two year files per variable on the append
+path, every file of one variable on the variable-major region path — so it is
+set well below xarray's default of 128 either way.
 
-`chunk_cache_size_mib` matters more than either. The raw files are chunked
-`[12, 57, 113]`, twelve timesteps deep, while the store is written one timestep
-at a time, so unless the cache holds a whole twelve-deep row of chunks (302 MiB)
-every chunk is decompressed twelve times; setting it to 512 MiB measured 7.6x
-end to end. It is per open file, so worst-case memory here is
-`file_cache_maxsize` x `chunk_cache_size_mib`.
+`chunk_cache_size_mib` matters more than either **on the append path**. The raw
+files are chunked `[12, 57, 113]`, twelve timesteps deep, while an append build
+writes one timestep at a time, so unless the cache holds a whole twelve-deep row
+of chunks (302 MiB) every chunk is decompressed twelve times; setting it to
+512 MiB measured 7.6x end to end. On the region path a block is one contiguous
+hyperslab per file and every source chunk it touches is decompressed once
+regardless, so the cache is not doing that job there. It is per open file either
+way, so worst-case memory is `file_cache_maxsize` x `chunk_cache_size_mib`.
 
 ### Non-obvious details
 
@@ -161,9 +272,34 @@ end to end. It is per open file, so worst-case memory here is
   `len(ancestry(...))` and the object count in `snapshots/` before concluding
   anything. `expire_snapshots` is never needed to clean these up, and reclaims
   essentially no bytes; `garbage_collect` alone is the right tool.
-- `merge_variables` requires an exact time-axis match across variables and
-  merges with `join='exact'`; a mismatch means an incomplete download and would
-  otherwise surface as a silently NaN-filled variable.
+- Nothing merges the variables any more, so nothing would notice one of them
+  being a year short — it would surface as a silently NaN-filled variable, or as
+  two sibling stores that do not line up. `check_time_axis` replaces that guard:
+  every build compares its own time axis against the family's **first** variable,
+  read from the netCDF headers, so the family is pinned collectively without any
+  build knowing about the others. It raises before anything is written.
+- A store's `title` and `summary` are **derived, not configured**
+  (`describe_variable`): a config cannot reach the netCDF `long_name`, so a
+  templated title could only say `Ep_aero` where this says 'potential
+  evaporation from the aerodynamic component'. Only the build calls it —
+  finalization deliberately does not, or a wording change would rewrite the
+  title of every published store.
+- `variable_attrs` in a config carries attributes true of one variable rather
+  than of the layout, merged over the shared `attrs`. Only `E` has any: its
+  upstream data gap. A store must not carry a note about data it does not hold.
+- `create_skeleton` rechunks time to `-1` before `to_zarr(compute=False)`. No
+  data is written there, but xarray validates chunk alignment anyway and refuses
+  a store chunk that straddles several dask chunks — which the per-file time
+  chunks `open_mfdataset` leaves behind always do. The rechunk is a graph
+  operation on a lazy dataset and reads nothing.
+- A region write must not carry the index coordinates that name the region, so
+  `write_by_region` drops `time`/`lat`/`lon` from the block before writing. The
+  block is `.load()`ed to numpy first, which also sidesteps xarray's
+  `safe_chunks` alignment check entirely.
+- `build_encoding` keeps 1-D index coordinates as a single chunk. Without that
+  they inherit the chunking of the data they index, which at `lat: 20` splits
+  the 1800-long `lat` coordinate into 90 chunks. Harmless at `lat: -1`, which is
+  why the spatial build never showed it.
 
 ## Conventions
 
@@ -174,27 +310,29 @@ does. Module docstrings carry the context needed to read the file.
 
 ### Layout
 
-Both entry points — `gleam_zarr.py` and `verify_gleam_zarr.py` — sit at the
-repo root, and `utils/` is importable only because a script's own directory is
-what lands on `sys.path`. That is why there is no install step, and it is the
-constraint any reorganisation runs into first: moving either script into a
-subdirectory breaks `from utils...` immediately.
+The three entry points — `gleam_zarr.py`, `verify_gleam_zarr.py` and
+`finalize_gleam_zarr.py` — sit at the repo root. `validation/` holds the
+developer tests, `stage_fixture.py` and `test_pipeline.py`.
 
-Considered and declined 2026-09-10, at one validation script: a subdirectory
-would mean adding `[build-system]` to `pyproject.toml` so `uv sync` installs
-the project editable. Worth doing, but not for one file — **revisit when a
-second validation script is committed**, and name the directory `validation/`
-rather than `tests/`. This is not a pytest suite: it audits a 1 TiB artifact,
-needs the raw tree staged on GLADE, and runs for ~9 minutes, so anything that
-collects `tests/` would pick up a file that cannot run off Derecho.
+**Settled 2026-09-14.** The trigger set on 2026-09-10 was "a second validation
+script", and `test_pipeline.py` is it. `pyproject.toml` now carries a
+`[build-system]`, so `uv sync` installs the project editable and `from utils...`
+resolves from a subdirectory; without that, only the repo root works, because a
+script's own directory is what lands on `sys.path`.
 
-`finalize_gleam_zarr.py` (added 2026-09-10) is a **third** root-level entry
-point, and it does not change that decision: the trigger stated above is a
-second *validation* script, and this is not one. It sits at the root for the
-same reason the other two do.
+The move was **narrower than the original note implied**, and the difference is
+worth keeping straight. `verify_gleam_zarr.py` stayed at the root: it is an
+operational tool, run against production stores and named as a gate in the
+finalization procedure, not a developer test. `validation/` holds the things a
+person runs while changing the code; the root holds the things a person runs
+against the data. Moving the verifier would have rewritten every documented
+command to no end.
 
-Whichever way that goes, do not paper over the import with `sys.path.insert`.
+Do not paper over the import with `sys.path.insert`; that is what the build
+system is for. Note that the root scripts are *not* importable from
+`validation/` — only `utils` is installed — which is why `test_pipeline.py`
+drives them as subprocesses. That is the better test anyway: it exercises the
+command line, the exit status and the log rather than the functions behind them.
 
-Test configs stay in `config/` beside the production one — they are inputs to
-`gleam_zarr.py`, not to the verifier, and one home for all configs beats
-splitting them by purpose.
+Configs stay in `config/`, production and fixture alike — they are inputs to
+`gleam_zarr.py`, and one home for all of them beats splitting them by purpose.

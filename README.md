@@ -9,10 +9,17 @@ paths, version, variables, chunk sizes, and the execution settings all come from
 the config, so a different store is a different config file rather than a code
 change.
 
-The write is **incremental and restartable** — timesteps are pushed out in
-batches, each committed to the icechunk repository before the next starts. A run
-killed by walltime leaves a valid store committed up to its last batch, and
-relaunching with the same config picks up from there.
+The write is **incremental and restartable**: the store goes out in pieces, each
+committed to the icechunk repository before the next starts, so a run killed by
+walltime leaves a valid store and relaunching with the same config picks up from
+there. What a piece is follows the chunking, and `write_strategy` picks between
+the two — `append` writes a batch of timesteps at a time, `region` writes one
+lat/lon block of the whole record at a time. See
+[How the build works](#how-the-build-works).
+
+Two stores are built from the same source files, differing only in chunking:
+`spatial` for reading maps, `temporal` for reading time series. Neither is
+derived from the other, so each is verified against the raw files on its own.
 
 ## Layout
 
@@ -25,13 +32,18 @@ the `zarr` directory next to it:
 ```
 
 The version is spelled `v4.3a` in the config but `v_4_3_a` on disk, and the
-store name carries the same directory spelling. With the config shipped here
+store name carries the same directory spelling. With the configs shipped here
 that resolves to:
 
 ```
 /glade/derecho/scratch/$USER/data/gleam/v_4_3_a/raw/daily/<variable>/*.nc
 /glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr
+/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.temporal.zarr
 ```
+
+The `suffix` field is the only difference between the two directories, and the
+only difference between the configs that build them is `chunks`,
+`write_strategy` and the block size.
 
 Repository files:
 
@@ -40,46 +52,68 @@ Repository files:
 | [gleam_zarr.py](gleam_zarr.py) | The pipeline: open, merge, chunk, write, resume |
 | [verify_gleam_zarr.py](verify_gleam_zarr.py) | Audits a finished store against the raw files. Read only throughout |
 | [finalize_gleam_zarr.py](finalize_gleam_zarr.py) | Writes attributes, tags a snapshot, collects unreachable objects. The only script here that mutates a finished store |
-| [config/config_zarr.yaml](config/config_zarr.yaml) | The config that drives it |
+| [config/config_zarr_spatial.yaml](config/config_zarr_spatial.yaml) | Config for the 14 map-chunked stores |
+| [config/config_zarr_temporal.yaml](config/config_zarr_temporal.yaml) | Config for the 14 time-series-chunked stores |
 | [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
-| [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, batched writes, resume checks |
+| [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, both write strategies, resume checks |
 | [utils/log_utils.py](utils/log_utils.py) | Logging to stdout and to the log file |
 | [draft_zarr.ipynb](draft_zarr.ipynb) | Exploratory scratch work, not part of the pipeline |
 | [TESTING.md](TESTING.md) | How the pipeline was validated and tuned, and what that found |
 
-## Where the finished store lives
+## Where the finished stores live
 
-The v4.3a daily store is built, verified and finalized:
+The v4.3a daily data is held as **28 stores: one per variable, in each of two
+chunkings**. The layout is the directory and the variable is the name:
 
 ```
-/glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr
+<zarr>/spatial/gleam.v_4_3_a.daily.native_0p1x0p1.<variable>.zarr
+<zarr>/temporal/gleam.v_4_3_a.daily.native_0p1x0p1.<variable>.zarr
 ```
 
-16802 timesteps, 14 variables, 1980-01-01 .. 2025-12-31 on the 1800x3600 grid;
-1.032 TiB compressed, 0.186 of logical. Verified against the source netCDF files
-on 2026-09-10 and tagged **`v4.3a-verified-20260910`**.
+Every store holds 16802 timesteps, 1980-01-01 .. 2025-12-31 on the 1800x3600
+grid, and every one is verified against the raw netCDF files and tagged
+**`v4.3a-verified-20260914`**. The two layouts of a variable carry identical
+coordinates and identical variable attributes — `verify_gleam_zarr.py --phases
+metadata` checks exactly that, per variable.
 
-Read it through the tag rather than the branch. A tag in icechunk is immutable,
-so it cannot be moved by a later commit, and `consolidated=False` is required —
-icechunk's manifest does the job zarr's consolidated metadata would:
+| | spatial | temporal |
+| --- | --- | --- |
+| chunk | `1, 1800, 3600`, one global map | `16802, 20, 20`, one 2x2 degree tile through the record |
+| cheap read | a map, a field | a point or small-area time series |
+| per variable | ~75 GiB, 16802 chunks (16777 for `E`) | ~72 GiB, ~6800 of 16200 tiles |
+| all 14 | 1.1 T | 1.1 T |
+| verified | 2026-09-14, 26-33 checks per store | 2026-09-14, 28-34 checks per store |
+
+A missing chunk is not missing data — zarr does not write a chunk whose cells
+are all fill. In the spatial stores that is the 25 days on which upstream `E` is
+entirely absent, which is why `E` holds 16777 chunks rather than 16802. In the
+temporal stores it is the ordinary case: a 20x20 tile that is ocean is fill for
+all 16802 timesteps, so more than half the chunk grid is legitimately absent.
+Either way the verifier traces the holes back to raw rather than assuming them
+(TESTING.md, findings 7, 15 and 16).
+
+Read a store through its tag rather than the branch. A tag in icechunk is
+immutable, so it cannot be moved by a later commit, and `consolidated=False` is
+required — icechunk's manifest does the job zarr's consolidated metadata would:
 
 ```python
 import icechunk
 import xarray as xr
 
 path = ('/glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/'
-        'gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr')
+        'temporal/gleam.v_4_3_a.daily.native_0p1x0p1.E.zarr')
 repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
-session = repository.readonly_session(tag='v4.3a-verified-20260910')
+session = repository.readonly_session(tag='v4.3a-verified-20260914')
 dataset = xr.open_zarr(session.store, consolidated=False)
 ```
 
-The store describes itself: `dataset.attrs` carries the provenance, the coverage
-and grid extents, a `chunking` note on what this layout is and is not good for,
-and `known_data_gaps` recording that `E` is absent on 25 upstream-missing days.
+Each store describes itself: `dataset.attrs` carries the provenance, the
+coverage and grid extents, a `chunking` note naming the sibling store to read
+for the other access pattern, `related_store`, and a `verification` line
+recording what was checked and when.
 
-**It is on scratch, which is purged.** That is a deliberate, accepted risk —
+**They are on scratch, which is purged.** That is a deliberate, accepted risk —
 moving it to `/glade/campaign/univ/umic0112` is a separate piece of work. Until
 then the store should be treated as reproducible rather than archived: rebuilding
 it costs ~57 core-hours, and the raw tree it is built from (~1.7 TiB) sits on the
@@ -102,43 +136,52 @@ previewed before it happens.
 3. `--gc` last. A tag is a ref, so tagging first makes the reachability set
    explicit rather than leaving it implicit in wherever `main` happens to point.
 
-`--status` reports where a store already stands, including which of the three
+One config addresses the 14 stores of a layout, and `--variable` picks one of
+them. `--status` reports where that store stands, including which of the three
 steps remain, so the order does not have to be remembered:
 
 ```bash
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
+uv run python finalize_gleam_zarr.py \
+    --config config/config_zarr_temporal.yaml --variable E --status
 ```
 
 ### The procedure
 
+The procedure is the same for every store, so the one being finalized is named
+once — its layout's config and its variable — and every step follows both:
+
 ```bash
+CONFIG=config/config_zarr_temporal.yaml    # the layout
+VARIABLE=E                                 # the store within it
+
 # 0. pre-flight. Only one writer can hold the icechunk branch, so no build or
 #    resume job may be running against this store
 qstat -u $USER
 
 # 1. baseline, and the state to compare everything against afterwards
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" --status
 
 # 2. attributes. Preview, then apply
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs --apply
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" --attrs
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" --attrs --apply
 
 # 3. tag. Convention is <version>-verified-<YYYYMMDD>, dated so a later
 #    re-verification can add its own tag without ambiguity
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml \
-    --tag v4.3a-verified-20260910 --apply
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" \
+    --tag v4.3a-verified-YYYYMMDD --apply
 
 # 4. collect unreachable objects. Read the dry run before applying
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" --gc
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" --gc --apply
 
 # 5. gates
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
-    --phases structure,sweep                       # ~35 s, full chunk coverage
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+uv run python verify_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" \
+    --phases structure,sweep               # ~35 s spatial, full chunk coverage
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE" --gc --apply
                                                    # must report all zeros
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
-                                                   # ~9 min, the final word
+uv run python verify_gleam_zarr.py --config "$CONFIG" --variable "$VARIABLE"
+                                                   # ~9 min spatial, ~15 min
+                                                   # temporal: the final word
 ```
 
 All of it runs on a login node for free. Step 4 is the only irreversible one.
@@ -184,23 +227,36 @@ is run from the repo root):
 uv sync
 ```
 
-Run the build directly, which is fine for a short test or a small subset:
+A build produces one store per variable. Run it directly for a short test or a
+small subset — with `--variable` for a single store, without it for the layout's
+whole family, one at a time. A store that already carries a tag has been
+published, and the build refuses to touch it without `--force`:
 
 ```bash
-uv run python gleam_zarr.py --config config/config_zarr.yaml
+uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml --variable E
+uv run python gleam_zarr.py --config config/config_zarr_fixture_spatial.yaml
 ```
 
 A full build is far too heavy for a login node, so **submit it as a batch job**
 with [submit_gleam_zarr.sh](submit_gleam_zarr.sh), which requests a Derecho node
 and runs the same command inside it:
 
+The job builds the layout's 14 variables as 14 parallel processes: the stores
+are independent repositories, so there is no branch for them to contend over and
+no reason to build them one after another. `VARIABLE=` builds just one.
+
 ```bash
 ./submit_gleam_zarr.sh                                  # default config
 CONFIG=config/other.yaml ./submit_gleam_zarr.sh         # any other config
+VARIABLE=E ./submit_gleam_zarr.sh                       # one store only
 
 # a short test on the shared develop queue, billed for the cpus it asks for
 QUEUE=develop NCPUS=8 WALLTIME=00:30:00 \
-    CONFIG=config/config_zarr_tiny.yaml ./submit_gleam_zarr.sh
+    CONFIG=config/config_zarr_fixture_spatial.yaml ./submit_gleam_zarr.sh
+
+# the region path needs memory rather than cpus: one block is held whole, and
+# a shared develop job gets a flat 10 GB default whatever ncpus it asked for
+QUEUE=develop NCPUS=2 MEM=96GB WALLTIME=06:00:00 ./submit_gleam_zarr.sh
 
 # chain a resume behind a running job so the two never write the store at once
 AFTER=<jobid> ./submit_gleam_zarr.sh
@@ -236,10 +292,32 @@ commit. Resubmitting after a completed run is a no-op.
 Progress goes to both stdout and `<directories.logs>/<log_file>`; PBS job output
 lands in `logs/` as well. Logs and all data outputs are gitignored.
 
+## Testing
+
+The pipeline has an end to end test that runs on a miniature fixture: four real
+variables over two years on a 100x200 window, subset out of the raw files by
+`validation/stage_fixture.py`. It builds both layouts, verifies every store
+against raw, and exercises the guards — the time-axis check, resume, and the
+refusal to rebuild a published store.
+
+```bash
+uv run python validation/stage_fixture.py     # once, ~1 minute, ~72 MB
+uv run python validation/test_pipeline.py     # ~2 minutes, exits non-zero on failure
+```
+
+It runs on a login node and spends no allocation. That is the point of the
+subset: the fixture it replaced was symlinks to whole year files, which made the
+same matrix a batch job, and a test that needs `qsub` is a test that stops being
+run. What a subset cannot tell you is anything about scale — memory, read
+amplification, walltime — which is what the `bench` configs and
+`verify_gleam_zarr.py` against the real stores are for.
+
 ## Configuration
 
-Every setting lives in the YAML file passed to `--config`. The one shipped here
-is [config/config_zarr.yaml](config/config_zarr.yaml).
+Every setting lives in the YAML file passed to `--config`. The two production
+ones shipped here are [config/config_zarr_spatial.yaml](config/config_zarr_spatial.yaml)
+and [config/config_zarr_temporal.yaml](config/config_zarr_temporal.yaml); they
+differ only in `suffix`, `chunks`, `write_strategy` and the execution settings.
 
 ### `directories`
 
@@ -254,7 +332,8 @@ is [config/config_zarr.yaml](config/config_zarr.yaml).
 | Key | Meaning |
 | --- | --- |
 | `filename` | Template for the store name. Any scalar at the top level of the config, plus any key under `output_conventions`, can be referenced by name; `{version}` is substituted in its on-disk form (`v_4_3_a`). Referring to a field the config does not define is an error. |
-| `suffix` | A free-form tag fed to the template — `spatial` here — to distinguish stores built from the same source with different chunking or post-processing. |
+| `suffix` | A free-form tag fed to the template — `spatial` or `temporal` here. It names the directory the layout's 14 stores sit in, so the same variable under two chunkings differs only by that one path segment. |
+| `variable` | Not written in the config: the scripts set it from `--variable`, and the filename template renders it. One config therefore addresses a whole layout, one store at a time. |
 
 ### `attrs`
 
@@ -264,14 +343,31 @@ Each string value is a template over the same fields the `filename` template
 uses, with `{version_label}` for the version as the config writes it (`v4.3a`)
 alongside `{version}` for the on-disk spelling (`v_4_3_a`).
 
-Three things stay out of this section deliberately. The coverage and grid
-attributes (`time_coverage_*`, `geospatial_*`) are derived from the data by
-`derive_attrs`, so they cannot drift from what was actually written. The source
-files' own attributes are carried over by the merge and kept underneath these,
-so GLEAM's upstream provenance survives. And `Conventions` is `ACDD-1.3` rather
+Things stay out of this section deliberately. The coverage and grid attributes
+(`time_coverage_*`, `geospatial_*`) are derived from the data by `derive_attrs`,
+so they cannot drift from what was actually written, and `title` and `summary`
+are derived by `describe_variable` for the same reason — a config cannot reach
+the netCDF `long_name`, so a templated title could only name the variable where
+a derived one can say what it is. The source files' own attributes are carried
+over from the netCDF files and kept underneath these, so GLEAM's upstream
+provenance survives. And `Conventions` is `ACDD-1.3` rather
 than a CF version: the variables' `standard_name` and `units` come through
 unaltered from upstream and are not CF-valid, which the `cf_compliance`
 attribute states outright rather than leaving a consumer to discover.
+
+### `variable_attrs`
+
+Optional. Attributes that belong to one variable rather than to the layout,
+keyed by variable name and merged over `attrs` for the store being built. Only
+`E` has any in practice: its 25 upstream-missing days are a property of that
+variable, and a store must not carry a note about data it does not hold.
+
+```yaml
+variable_attrs:
+  E:
+    known_data_gaps: >-
+      This variable is entirely fill (NaN) on 25 days ...
+```
 
 ### Top-level keys
 
@@ -282,23 +378,29 @@ attribute states outright rather than leaving a consumer to discover.
 | `variables` | Either a list of variable names or the shorthand `all`. `all` expands to every variable directory actually present under `raw/<temporal_resolution>/`; an explicit list is kept in the order given, and a listed variable with no directory on disk is an error rather than a silent skip. |
 | `temporal_resolution` | Which resolution to build — `daily` here. Selects the subdirectory under `raw/`, and only the one configured is built. |
 | `grid_name` | Label for the grid the data is on (`native_0p1x0p1`). Used in the store name; it describes the data rather than reprojecting it, so changing it renames the output, it does not regrid. |
-| `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. `time: 1, lat: -1, lon: -1` gives one whole global map per chunk — 24.7 MiB on the 1800x3600 grid — which is what the `spatial` suffix in the store name refers to: it is the layout for reading maps, and the worst one for reading a long time series at a point. This is the main knob on both the shape of the output and the memory a run takes; see below. |
+| `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. This is the main knob on both the shape of the output and what a run costs. `time: 1, lat: -1, lon: -1` gives one whole global map per chunk, 24.7 MiB on the 1800x3600 grid — the `spatial` layout, built for reading maps and the worst possible one for a point time series, which touches all 16802 chunks of a variable. `time: -1, lat: 20, lon: 20` gives one 2x2 degree tile through the whole record, 25.6 MiB — the `temporal` layout, where that time series is a single chunk and a global map is the worst case instead. |
+| `write_strategy` | `append` (the default) or `region`; how the store is filled. It is not a free choice: it has to match the chunking, and `resolve_write_strategy` raises rather than letting a mismatch through, because both mismatches fail quietly. An `append` build of a store whose time chunk spans the record collapses into a single uninterruptible commit that a walltime kill loses entirely; a `region` build of a shallowly chunked one reads the whole record into memory to write chunks one timestep deep. |
+| `block_shape` | `region` only. The lat/lon block read and committed as one unit, which must be a whole number of output chunks. Two things decide it. It has to be much wider than a chunk, because the raw files are chunked `[12, 57, 113]` and a block only 20 cells wide would decompress each 57x113 source chunk once for every tile it covers. And **it has to span `lon` entirely** (`lon: -1`): a narrower block reads a strided subset of the source chunks — 11 of every 32 along lon, scattered through the file — rather than contiguous runs, which measured pathologically slow on dense variables at identical volume. At `lat: 200, lon: -1` that is 45.1 GiB resident per block against 1.43x read amplification, a trade worth making because Derecho bills cpus and not memory. It is also the resume granularity, so it is what a killed job redoes. |
 
 ### The four settings that decide what a run costs
 
 These are the keys worth setting deliberately before a long job.
-`timesteps_per_commit` decides how much work a crash throws away; the other
-three decide how fast the run goes and how much memory it needs. None of the
-latter three change the store that gets written, only the resources used to
-write it — and `chunk_cache_size_mib` is worth more than the other two put
-together.
+`timesteps_per_commit` (on the `append` path) and `block_shape` (on the
+`region` path) decide how much work a crash throws away; the other three decide
+how fast the run goes and how much memory it needs. None of the latter three
+change the store that gets written, only the resources used to write it.
+
+Note that `chunk_cache_size_mib` is worth far more than the other two on the
+`append` path and much less on the `region` path, for the same reason: it exists
+to stop a twelve-deep source chunk being decompressed once per timestep, and the
+`region` path reads each source chunk once anyway, in one hyperslab per file.
 
 | Key | Default | What it controls |
 | --- | --- | --- |
-| `timesteps_per_commit` | 100 | Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask — at the configured `time: 1` the rounding is a no-op, so this only bites if `time` is raised; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
+| `timesteps_per_commit` | 100 | `append` only. Timesteps written and committed to icechunk as one unit, and so the point a killed run resumes from. Smaller batches redo less after a failure; larger ones spend proportionally less time committing. Two traps: it is **rounded** to a whole multiple of the `time` chunk (`time: 7` turns 100 into 98), because xarray cannot append onto a partially filled chunk from dask — at the configured `time: 1` the rounding is a no-op, so this only bites if `time` is raised; and it is **not** a memory knob — the ~34 GiB `batch.nbytes` in the log is the batch's logical size, not what is resident, since batches stream chunk by chunk. Changing it between runs breaks resume: a store whose length is not a whole number of the current batch size is rejected, and the fix is to rebuild. |
 | `num_workers` | dask's own, sized from the cpuset | Size of the dask thread pool, and so how many chunks are in flight — roughly `num_workers` x one chunk, about 200 MiB at 8 workers and 24.7 MiB chunks — small enough at this chunk size that the open file cache below is the larger memory term. Note that it buys much less parallelism than it looks like it should: xarray locks every netCDF read behind one process-global HDF5 lock, so reads serialize no matter how many workers there are, and only the zarr compression on the write side scales. It **must not exceed the job's `ncpus`**: if you need more workers, raise `ncpus` in [submit_gleam_zarr.sh](submit_gleam_zarr.sh) rather than lowering the config, which the script checks and refuses to launch on. |
-| `chunk_cache_size_mib` | HDF5's own, ~16 MiB | Decompressed HDF5 chunk cache held per open netCDF file. **The single largest performance setting here.** The raw files are chunked `[12, 57, 113]` — twelve timesteps deep — while the store is written one timestep at a time, so unless this holds a whole twelve-deep row of chunks (1024 chunks, 302 MiB) HDF5 decompresses every chunk twelve times over. Measured on real data: reading twelve timesteps one at a time takes 9.06 s at the default and 0.87 s at 512 MiB, and 8.24 s vs 1.09 s end to end through xarray. It changes nothing about the store. Budget it against `file_cache_maxsize`, which multiplies it, and against `num_workers`, since threads reading distant timesteps touch different chunk rows. |
-| `file_cache_maxsize` | xarray's, 128 files | How many netCDF files stay open, each holding its own 64 MiB HDF5 chunk cache — the second memory term, and easy to overlook because the files are cheap but their caches are not. It only has to cover the files one batch touches, at most two year files per variable, so `32` is generous here and well below the several idle GiB the default would hold. |
+| `chunk_cache_size_mib` | HDF5's own, ~16 MiB | Decompressed HDF5 chunk cache held per open netCDF file. **The single largest performance setting on the `append` path.** The raw files are chunked `[12, 57, 113]` — twelve timesteps deep — while an `append` build writes one timestep at a time, so unless this holds a whole twelve-deep row of chunks (1024 chunks, 302 MiB) HDF5 decompresses every chunk twelve times over. Measured on real data: reading twelve timesteps one at a time takes 9.06 s at the default and 0.87 s at 512 MiB, and 8.24 s vs 1.09 s end to end through xarray. On the `region` path it is worth much less, because a block is one contiguous hyperslab per file and every source chunk it touches is decompressed once regardless. It changes nothing about the store. Budget it against `file_cache_maxsize`, which multiplies it. |
+| `file_cache_maxsize` | xarray's, 128 files | How many netCDF files stay open, each holding its own HDF5 chunk cache — the second memory term, and easy to overlook because the files are cheap but their caches are not. It only has to cover the files one unit of work touches: at most two year files per variable on the `append` path, so `32`; every file of one variable on the `region` path, which is variable-major, so `64`. |
 
 Both memory settings are applied by `configure_runtime` before anything opens a
 file, since neither takes effect retroactively, and the resolved values are
@@ -310,28 +412,50 @@ settings it actually ran with.
 1. **Resolve** — expand `variables: all` against the directories present under
    `raw/<temporal_resolution>/`, and list each variable's yearly files in time
    order.
-2. **Open** — each variable is opened with `open_mfdataset` across its whole
-   year range, concatenated along time in the order given. Note that
-   `parallel=True` is deliberately omitted: opening netCDF from several threads
-   crashes the HDF5 library in this build. Do not add it.
-3. **Merge** — variables are merged with `join='exact'` after an explicit check
-   that they share an identical time axis. A mismatch means an incomplete
-   download and is raised as an error; without the check it would surface much
-   later as a silently NaN-filled variable.
+2. **Open** — the variable is opened with `open_mfdataset` across its whole
+   year range, concatenated along time in the order given. The chunks a file is
+   opened with are the unit dask reads in, which is *not* the same thing as the
+   store's chunking: on the `region` path it is the block, because opening 644
+   files as 20x20 tiles would build some ten million dask chunks before a byte
+   is read. Note that `parallel=True` is deliberately omitted: opening netCDF
+   from several threads crashes the HDF5 library in this build. Do not add it.
+3. **Check the time axis** — the variable's timesteps are compared against the
+   family's first variable, read from the netCDF headers. Nothing merges the
+   variables now that a store holds one, so nothing else would notice one of
+   them being a year short: it would surface much later as a silently NaN-filled
+   variable, or as two sibling stores that do not line up. A mismatch is raised
+   before anything is written.
 4. **Chunk** — `-1` entries in `chunks` are resolved against the now-known
-   dimension sizes. `open_mfdataset` chunks per file, so time chunks follow the
-   yearly file boundaries until this explicit rechunk squares them up.
+   dimension sizes, which is also when `write_strategy` can be checked against
+   them. On the `append` path `open_mfdataset` chunks per file, so time chunks
+   follow the yearly file boundaries until an explicit rechunk squares them up;
+   the `region` path writes from memory rather than from dask and leaves the
+   blocks chunked the way they were read.
 5. **Encode** — the netCDF encoding xarray carries over (`zlib`, `chunksizes`,
    ...) is rejected by the zarr backend, so `build_encoding` clears each
    variable's `.encoding` and rebuilds it rather than overriding keys. Time is
    pinned to `days since 1900-01-01`, proleptic_gregorian, int64 so that every
-   appended batch encodes identically.
-6. **Write** — the first batch lays down the arrays with that encoding; every
-   later batch appends along `time`. Each is committed before the next starts.
+   appended batch encodes identically. Index coordinates are kept as a single
+   chunk rather than inheriting the chunking of the data they index, which at
+   `lat: 20` would otherwise split the 1800-long `lat` coordinate into 90.
+6. **Write**, one of two ways:
+   - `append` — the first batch lays down the arrays with that encoding; every
+     later batch appends along `time`. Each is committed before the next starts.
+   - `region` — `create_skeleton` lays down the group, the array metadata and
+     the coordinates with `compute=False`, which writes no data chunk at all,
+     and commits. Each block is then read into memory whole, written into the
+     skeleton with `region=`, and committed on its own.
 
-On resume, `check_resume` compares the stored variables and the overlapping
-timesteps against the incoming dataset and refuses to append onto a store built
-from a different configuration.
+On resume the `append` path's `check_resume` compares the stored variables and
+the overlapping timesteps against the incoming dataset, and refuses to append
+onto a store built from a different configuration. The `region` path cannot lean
+on the store's length, since every array is full-sized from the moment the
+skeleton exists, so `check_resume_region` compares the variables, all three
+coordinates and the chunk grid instead, and `committed_blocks` reads the blocks
+already written back out of the commit messages. Progress lives in the history
+rather than in the store so that resuming needs nothing but the ancestry
+icechunk keeps anyway, and so `finalize_gleam_zarr.py` does not have to strip
+build bookkeeping out of the attributes it publishes.
 
 ## Conventions
 

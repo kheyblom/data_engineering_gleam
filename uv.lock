@@ -360,7 +360,7 @@ wheels = [
 [[package]]
 name = "data-engineering-gleam"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "cartopy" },
     { name = "cftime" },
