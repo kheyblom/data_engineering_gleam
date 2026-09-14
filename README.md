@@ -113,9 +113,6 @@ coverage and grid extents, a `chunking` note naming the sibling store to read
 for the other access pattern, `related_store`, and a `verification` line
 recording what was checked and when.
 
-The two **all-variable** stores these were split from are still on disk beside
-them, superseded and pending deletion. Nothing should be built against them.
-
 **They are on scratch, which is purged.** That is a deliberate, accepted risk —
 moving it to `/glade/campaign/univ/umic0112` is a separate piece of work. Until
 then the store should be treated as reproducible rather than archived: rebuilding

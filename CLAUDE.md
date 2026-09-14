@@ -17,8 +17,8 @@ layout with `--variable` picking the store within it.
 The two layouts are not derived from each other: each was built from raw and
 verified against raw independently, so nothing about one has to be trusted to
 trust the other. The per-variable stores were split from two all-variable stores
-(still on disk, superseded, pending deletion) and each was then verified against
-raw in its own right, so the split is not trusted either.
+-- deleted 2026-09-14, once all 28 had been verified against raw in their own
+right -- so the split is not trusted either.
 
 ## Commands
 

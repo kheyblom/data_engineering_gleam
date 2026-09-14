@@ -843,6 +843,19 @@ every store** is the number that matters before an irreversible step: the
 collection could only ever have removed metadata. Every store then passed a
 re-audit of its whole manifest, and a second collection found nothing.
 
+### The all-variable stores are gone
+
+Deleted 2026-09-14, ~2.2 T, once all 28 per-variable stores had been verified
+against raw, tagged and collected -- and once reading a per-variable store
+through its tag had been shown to work with the originals still in place. The
+order matters: the split stores were never derived from a running original, so
+nothing depended on them, but that is worth demonstrating rather than assuming
+before an irreversible delete.
+
+The configs stopped addressing them a commit earlier, which is its own small
+safeguard: after the template gained `{variable}`, no config could render the
+path of an all-variable store even by accident.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
