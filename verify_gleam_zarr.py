@@ -28,7 +28,8 @@ one map. The box shape is picked once, in ``box_shape``, and everything
 downstream follows it. Either way a box is read from the store and from the raw
 files independently and compared cell by cell.
 
-Six phases, selectable with ``--phases``:
+Seven phases, selectable with ``--phases``. The first six run by default; the
+seventh needs a second store to compare against:
 
 ``structure``
     Dimensions, chunk shapes, dtypes, fill values, codecs and attributes,
@@ -50,6 +51,10 @@ Six phases, selectable with ``--phases``:
     the cheapest available check on the merge itself.
 ``ranges``
     Physical bounds implied by each variable's ``units`` attribute.
+``metadata``
+    The store's attributes and coordinates against a sibling store's, so two
+    stores built from the same files describe the same data the same way.
+    Needs ``--compare-with``, so it is not part of a default run.
 
 A phase reports FAIL only for something the *store* got wrong. Properties of
 the upstream data that look like defects -- E's all-fill days, a valid-cell
@@ -82,7 +87,6 @@ from utils.path_utils import (
 )
 from utils.zarr_utils import (
     BRANCH,
-    DEFAULT_WRITE_STRATEGY,
     commit_batch_size,
     iter_blocks,
     resolve_block_shape,
@@ -127,7 +131,30 @@ IDENTITIES = (
 # them against raw -- measured rather than assumed.
 DEGENERATE_BYTES = {'spatial': 50 * 1024, 'temporal': 0}
 
-PHASES = ('structure', 'index', 'samples', 'sweep', 'identities', 'ranges')
+PHASES = (
+    'structure', 'index', 'samples', 'sweep', 'identities', 'ranges', 'metadata'
+)
+
+# 'metadata' compares two stores, so it needs a second config and cannot run in
+# a default sweep of a single one
+DEFAULT_PHASES = tuple(p for p in PHASES if p != 'metadata')
+
+# global attributes that describe how a store is laid out, when it was built or
+# what has been proven about it. Two stores built from the same files
+# legitimately differ on these and must agree on everything else: the rest is
+# either carried over from the source files or shared prose, so a difference
+# there means the two stores describe the same data differently.
+LAYOUT_ATTRS = frozenset(
+    {
+        'title',
+        'chunking',
+        'history',
+        'date_created',
+        'related_store',
+        'known_data_gaps',
+        'verification',
+    }
+)
 
 
 class Report:
@@ -183,8 +210,9 @@ def parse_args():
     parser.add_argument(
         '--phases',
         type=str,
-        default=','.join(PHASES),
-        help=f'Comma separated subset of {",".join(PHASES)}.',
+        default=','.join(DEFAULT_PHASES),
+        help=f'Comma separated subset of {",".join(PHASES)}. '
+        'metadata needs --compare-with and is not run by default.',
     )
     parser.add_argument(
         '--samples',
@@ -217,6 +245,21 @@ def parse_args():
         help='Smallest written chunks per variable to read back and compare '
         'against raw on the temporal layout, where a size floor cannot tell a '
         'sparse chunk from a truncated one.',
+    )
+    parser.add_argument(
+        '--trace-absent',
+        type=int,
+        default=24,
+        help='Budget, shared over the variables, for tracing absent tiles that '
+        'another variable did write. Each one is read from raw across the whole '
+        'record, which settles it rather than sampling it.',
+    )
+    parser.add_argument(
+        '--compare-with',
+        type=str,
+        default=None,
+        help='Config of a sibling store to compare metadata against. Required '
+        'by the metadata phase and ignored by every other one.',
     )
     parser.add_argument(
         '--mask-days',
@@ -424,6 +467,23 @@ def tile_grid(chunks, sizes):
     )
 
 
+def tile_valid_counts(plane, chunks, grid):
+    """Count the cells that are not fill in each tile of the chunk grid.
+
+    Args:
+        plane (numpy.ndarray): A raw plane, fill sentinel intact.
+        chunks (dict): Resolved chunk sizes.
+        grid (tuple): Number of chunks along lat and lon.
+
+    Returns:
+        numpy.ndarray: Integer (n_lat_tiles, n_lon_tiles) counts.
+    """
+    valid = plane != RAW_FILL
+    return valid.reshape(grid[0], chunks['lat'], grid[1], chunks['lon']).sum(
+        axis=(1, 3)
+    )
+
+
 def coarsen_to_tiles(plane, chunks, grid):
     """Reduce a full plane's valid-cell mask onto the store's chunk grid.
 
@@ -436,9 +496,66 @@ def coarsen_to_tiles(plane, chunks, grid):
         numpy.ndarray: Boolean (n_lat_tiles, n_lon_tiles), True where the tile
             holds at least one cell that is not fill.
     """
-    valid = plane != RAW_FILL
-    return valid.reshape(grid[0], chunks['lat'], grid[1], chunks['lon']).any(
-        axis=(1, 3)
+    return tile_valid_counts(plane, chunks, grid) > 0
+
+
+def land_strata(index, name, chunks, grid, timestep):
+    """Split the chunk grid into tiles that are fully, partly and never covered.
+
+    One plane from the middle of the record is enough to say where the land is:
+    the valid footprint moves from day to day, but not between ocean and land.
+
+    Args:
+        index (dict): The raw index from ``build_raw_index``.
+        name (str): Variable whose footprint to take.
+        chunks (dict): Resolved chunk sizes.
+        grid (tuple): Number of chunks along lat and lon.
+        timestep (int): Which plane to read.
+
+    Returns:
+        tuple: Three (n, 2) arrays of tile indices -- fully covered, partly
+            covered, and holding nothing at all on that day.
+    """
+    counts = tile_valid_counts(read_raw_plane(index, name, timestep), chunks, grid)
+    cells = chunks['lat'] * chunks['lon']
+    return (
+        np.argwhere(counts == cells),
+        np.argwhere((counts > 0) & (counts < cells)),
+        np.argwhere(counts == 0),
+    )
+
+
+def grid_divides(chunks, sizes):
+    """Whether the lat/lon grid is a whole number of chunks.
+
+    A raw plane can only be coarsened onto the chunk grid when it is, so the
+    checks that do that fall back to something weaker when it is not.
+
+    Args:
+        chunks (dict): Resolved chunk sizes.
+        sizes (Mapping): Length of each dimension, e.g. ``dataset.sizes``.
+
+    Returns:
+        bool: True if lat and lon are both whole multiples of their chunk.
+    """
+    return not (sizes['lat'] % chunks['lat'] or sizes['lon'] % chunks['lon'])
+
+
+def tile_box(tile, chunks, sizes):
+    """The (lat, lon) slices of one tile of the chunk grid.
+
+    Args:
+        tile (tuple): Tile index along lat and lon.
+        chunks (dict): Resolved chunk sizes.
+        sizes (Mapping): Length of each dimension, e.g. ``dataset.sizes``.
+
+    Returns:
+        tuple: The latitude and longitude slices, clipped at the grid edge.
+    """
+    i, j = int(tile[0]), int(tile[1])
+    return (
+        slice(i * chunks['lat'], min((i + 1) * chunks['lat'], sizes['lat'])),
+        slice(j * chunks['lon'], min((j + 1) * chunks['lon'], sizes['lon'])),
     )
 
 
@@ -517,6 +634,17 @@ def check_structure(report, session, dataset, variables, settings):
     report.note(f'codecs {root[variables[0]].metadata.codecs}')
     report.note(f'global attributes {sorted(dataset.attrs)}')
 
+    # the chunking attribute is the one piece of prose a reader is expected to
+    # act on, and prose does not follow a config edit the way the arrays do, so
+    # the shape it claims is checked against the shape that was written
+    if 'chunking' in dataset.attrs:
+        claimed = f'({", ".join(str(v) for v in expected)})'
+        report.check(
+            f'chunking attribute describes this store, {claimed}',
+            claimed in dataset.attrs['chunking'],
+            f'{dataset.attrs["chunking"][:80]}...',
+        )
+
     # a daily store must have one timestep per day of its own span, or a file
     # was missed somewhere between the download and the merge
     days = dataset['time'].values
@@ -578,14 +706,25 @@ def check_index(report, dataset, index, variables):
     raw.close()
 
 
-def sample_spots(dataset, chunks, layout, rng, count):
+def sample_spots(dataset, index, variables, chunks, layout, rng, count):
     """Choose positions to read, shaped as the store's own chunk.
 
     A spot is a box without a variable: the same position is read for every
     variable an identity or a bounds check needs, so they line up.
 
+    On the temporal layout the draw is taken from the tiles that hold land
+    rather than uniformly from the grid. Most of a 20x20 tiling of this grid is
+    ocean, and an all-fill spot has no identity to close and no bound to check,
+    so a uniform draw quietly spends the whole budget on nothing -- the phases
+    would report success having tested nothing at all. Covered and coastal
+    tiles alternate, because a component sum closing over open land and one
+    closing along a coastline are not the same test.
+
     Args:
         dataset (xarray.Dataset): The decoded store.
+        index (dict): The raw index from ``build_raw_index``.
+        variables (list): Variable names, the first of which supplies the
+            footprint the draw is stratified on.
         chunks (dict): Resolved chunk sizes.
         layout (str): From ``store_layout``.
         rng (numpy.random.Generator): Source of the draw.
@@ -600,18 +739,37 @@ def sample_spots(dataset, chunks, layout, rng, count):
         return [(t, t + 1, slice(None), slice(None)) for t in days]
 
     grid = tile_grid(chunks, sizes)
-    spots = []
-    for _ in range(count):
-        i = int(rng.integers(grid[0]))
-        j = int(rng.integers(grid[1]))
-        spots.append(
-            (
-                0,
-                sizes['time'],
-                slice(i * chunks['lat'], min((i + 1) * chunks['lat'], sizes['lat'])),
-                slice(j * chunks['lon'], min((j + 1) * chunks['lon'], sizes['lon'])),
-            )
+    tiles = []
+    if grid_divides(chunks, sizes):
+        covered, coastal, _ = land_strata(
+            index, variables[0], chunks, grid, sizes['time'] // 2
         )
+        drawn = []
+        half = -(-count // 2)
+        for stratum in (covered, coastal):
+            if not len(stratum):
+                continue
+            picks = rng.choice(
+                len(stratum), size=min(len(stratum), half), replace=False
+            )
+            drawn.append([tuple(int(v) for v in stratum[k]) for k in picks])
+        # alternate the strata so a short one does not hand the whole draw to
+        # the other
+        while drawn and len(tiles) < count:
+            for group in list(drawn):
+                if not group:
+                    drawn.remove(group)
+                    continue
+                tiles.append(group.pop())
+                if len(tiles) >= count:
+                    break
+    while len(tiles) < count:
+        tiles.append((int(rng.integers(grid[0])), int(rng.integers(grid[1]))))
+
+    spots = []
+    for tile in tiles:
+        lat, lon = tile_box(tile, chunks, sizes)
+        spots.append((0, sizes['time'], lat, lon))
     return spots
 
 
@@ -636,7 +794,7 @@ def describe_box(dataset, t0, t1, lat, lon):
     )
 
 
-def sample_boxes(dataset, index, variables, args, chunks, layout):
+def sample_boxes(dataset, index, variables, args, chunks, layout, settings):
     """Choose which boxes to compare against raw, stratified over the variables.
 
     On the spatial layout a box is a plane, so the draw adds the file seams and
@@ -658,6 +816,7 @@ def sample_boxes(dataset, index, variables, args, chunks, layout):
         args (argparse.Namespace): Parsed arguments.
         chunks (dict): Resolved chunk sizes.
         layout (str): From ``store_layout``.
+        settings (dict): The loaded configuration, for the commit batch size.
 
     Returns:
         list: (name, t0, t1, lat_slice, lon_slice) boxes to compare.
@@ -681,7 +840,7 @@ def sample_boxes(dataset, index, variables, args, chunks, layout):
             picks.append((name, int(seam) - 1))
             picks.append((name, int(seam)))
         # the first and last timestep, and either side of each commit boundary
-        batch = chunks['time'] * max(1, round(100 / chunks['time']))
+        batch = commit_batch_size(chunks, settings)
         boundaries = {0, n_time - 1, n_time - 2}
         for edge in range(batch, n_time, batch):
             boundaries.update({edge - 1, edge, edge + 1})
@@ -691,26 +850,14 @@ def sample_boxes(dataset, index, variables, args, chunks, layout):
         return [(name, t, t + 1, slice(None), slice(None)) for name, t in picks]
 
     grid = tile_grid(chunks, sizes)
-    divides = (
-        sizes['lat'] % chunks['lat'] == 0 and sizes['lon'] % chunks['lon'] == 0
-    )
+    divides = grid_divides(chunks, sizes)
     boxes = []
     corners = [(0, 0), (0, grid[1] - 1), (grid[0] - 1, 0), (grid[0] - 1, grid[1] - 1)]
     for position, name in enumerate(variables):
         tiles = []
         if divides:
             # one plane from the middle of the record says which tiles hold land
-            plane = read_raw_plane(index, name, n_time // 2)
-            counts = (plane != RAW_FILL).reshape(
-                grid[0], chunks['lat'], grid[1], chunks['lon']
-            ).sum(axis=(1, 3))
-            cells = chunks['lat'] * chunks['lon']
-            strata = (
-                np.argwhere(counts == cells),
-                np.argwhere((counts > 0) & (counts < cells)),
-                np.argwhere(counts == 0),
-            )
-            for stratum in strata:
+            for stratum in land_strata(index, name, chunks, grid, n_time // 2):
                 if len(stratum):
                     tiles.append(tuple(stratum[int(rng.integers(len(stratum)))]))
         while len(tiles) < per_variable:
@@ -718,20 +865,13 @@ def sample_boxes(dataset, index, variables, args, chunks, layout):
         # the corners rotate through the variables rather than being repeated
         tiles.append(corners[position % len(corners)])
 
-        for i, j in tiles:
-            boxes.append(
-                (
-                    name,
-                    0,
-                    n_time,
-                    slice(i * chunks['lat'], min((i + 1) * chunks['lat'], sizes['lat'])),
-                    slice(j * chunks['lon'], min((j + 1) * chunks['lon'], sizes['lon'])),
-                )
-            )
+        for tile in tiles:
+            lat, lon = tile_box(tile, chunks, sizes)
+            boxes.append((name, 0, n_time, lat, lon))
     return boxes
 
 
-def check_samples(report, dataset, index, variables, args, chunks, layout):
+def check_samples(report, dataset, index, variables, args, chunks, layout, settings):
     """Compare boxes against raw, cell by cell.
 
     Args:
@@ -742,8 +882,9 @@ def check_samples(report, dataset, index, variables, args, chunks, layout):
         args (argparse.Namespace): Parsed arguments.
         chunks (dict): Resolved chunk sizes.
         layout (str): From ``store_layout``.
+        settings (dict): The loaded configuration.
     """
-    boxes = sample_boxes(dataset, index, variables, args, chunks, layout)
+    boxes = sample_boxes(dataset, index, variables, args, chunks, layout, settings)
     dates = dataset['time'].values
     n_cells = sum(
         (t1 - t0)
@@ -790,6 +931,63 @@ def check_samples(report, dataset, index, variables, args, chunks, layout):
     )
 
 
+def trace_absent_tiles(report, dataset, index, written, chunks, args):
+    """Settle the absent tiles that another variable did write.
+
+    The sweep justifies an absent tile against a handful of sampled raw planes,
+    which cannot see a tile that holds data on no sampled day. The variables
+    check each other instead: they share a land mask closely enough that a tile
+    one variable wrote and another did not is the only interesting kind of hole,
+    and there are few enough of them to settle outright by reading the whole
+    record from raw. That is a proof rather than a sample, so it is worth its
+    cost -- and it does have a cost, one whole-record read per tile, which is
+    why the budget is shared over the variables rather than spent per variable.
+
+    Args:
+        report (Report): Where to record outcomes.
+        dataset (xarray.Dataset): The decoded store.
+        index (dict): The raw index.
+        written (dict): Variable name -> boolean tile grid of written chunks.
+        chunks (dict): Resolved chunk sizes.
+        args (argparse.Namespace): Parsed arguments.
+    """
+    sizes = dataset.sizes
+    union = np.zeros(next(iter(written.values())).shape, dtype=bool)
+    for tiles in written.values():
+        union |= tiles
+
+    suspect = {
+        name: np.argwhere(union & ~tiles) for name, tiles in written.items()
+    }
+    pending = {name: tiles for name, tiles in suspect.items() if len(tiles)}
+    if not pending:
+        report.note(
+            'every variable wrote every tile any other variable wrote, so no '
+            'absent tile needs tracing'
+        )
+        return
+
+    budget = max(1, args.trace_absent // len(pending))
+    rng = np.random.default_rng(args.seed)
+    for name, tiles in pending.items():
+        take = tiles
+        if len(tiles) > budget:
+            take = tiles[rng.choice(len(tiles), size=budget, replace=False)]
+        lost = []
+        for tile in take:
+            lat, lon = tile_box(tile, chunks, sizes)
+            raw = read_raw_box(index, name, 0, sizes['time'], lat, lon)
+            if not bool(np.all(raw == RAW_FILL)):
+                lost.append((int(tile[0]), int(tile[1])))
+        report.check(
+            f'{name:9s} absent tiles that another variable wrote are all-fill '
+            f'in raw through the whole record',
+            not lost,
+            f'{len(take)} of {len(tiles)} such tiles read end to end'
+            + (f'; DATA LOSS at {lost[:5]}' if lost else ''),
+        )
+
+
 async def check_sweep(report, session, dataset, index, variables, chunks, layout, args):
     """Check every chunk in the store for presence, placement and size.
 
@@ -825,6 +1023,7 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
     n_grid = n_time_chunks * grid[0] * grid[1]
     floor = DEGENERATE_BYTES[layout]
     total_bytes = 0
+    written_grids = {}
 
     mask_days = sorted(
         set(int(x) for x in np.linspace(0, n_time - 1, args.mask_days).round())
@@ -847,6 +1046,14 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
             ),
             f'{len(coordinates)} of {n_grid} grid positions written',
         )
+
+        if not coordinates:
+            report.check(
+                f'{name:9s} has at least one written chunk',
+                False,
+                'nothing in the manifest for this variable',
+            )
+            continue
 
         chunk_sizes = np.asarray(
             await asyncio.gather(
@@ -893,7 +1100,7 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
             )
             continue
 
-        if sizes['lat'] % chunks['lat'] or sizes['lon'] % chunks['lon']:
+        if not grid_divides(chunks, sizes):
             report.note(
                 f'{name} absent chunks not checked: the grid is not a whole '
                 f'number of chunks, so a raw plane cannot be coarsened onto it'
@@ -907,6 +1114,7 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
         written = np.zeros(grid, dtype=bool)
         for _, i, j in coordinates:
             written[i, j] = True
+        written_grids[name] = written
         lost = np.argwhere(ever & ~written)
         report.check(
             f'{name:9s} every tile holding data on a sampled day was written',
@@ -923,28 +1131,29 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
         # the smallest chunks are read back and compared instead. If a tile is
         # small because its data is sparse this passes; if it is small because
         # it was cut short, nothing else in the sweep would notice.
-        order = [int(k) for k in np.argsort(chunk_sizes)[: args.smallest]]
-        damaged = []
+        order = [int(k) for k in np.argsort(chunk_sizes)[: max(0, args.smallest)]]
+        damaged, decoded = [], []
         for k in order:
-            _, i, j = coordinates[k]
-            lat = slice(i * chunks['lat'], min((i + 1) * chunks['lat'], sizes['lat']))
-            lon = slice(j * chunks['lon'], min((j + 1) * chunks['lon'], sizes['lon']))
+            lat, lon = tile_box(coordinates[k][1:], chunks, sizes)
             raw = read_raw_box(index, name, 0, n_time, lat, lon)
             stored = dataset[name].isel(
                 time=slice(0, n_time), lat=lat, lon=lon
             ).values
             mask_ok, values_ok, valid_cells = compare_box(stored, raw)
+            decoded.append((int(chunk_sizes[k]), valid_cells))
             if not (mask_ok and values_ok):
                 damaged.append(coordinates[k])
-        report.check(
-            f'{name:9s} the {len(order)} smallest written chunks decode '
-            f'bit-identical to raw',
-            not damaged,
-            f'smallest {int(chunk_sizes[order[0]])} B holds '
-            f'{valid_cells} valid cells of '
-            f'{n_time * chunks["lat"] * chunks["lon"]}'
-            + (f'; DAMAGED at {damaged}' if damaged else ''),
-        )
+        if decoded:
+            report.check(
+                f'{name:9s} the {len(order)} smallest written chunks decode '
+                f'bit-identical to raw',
+                not damaged,
+                f'smallest {decoded[0][0]} B holds {decoded[0][1]} valid cells '
+                f'of {n_time * chunks["lat"] * chunks["lon"]}'
+                + (f'; DAMAGED at {damaged}' if damaged else ''),
+            )
+        else:
+            report.note(f'{name} no chunk read back: --smallest is {args.smallest}')
 
         report.note(
             f'{name}: {n_grid - int(written.sum())} of {n_grid} tiles absent, '
@@ -953,6 +1162,9 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
             f'sampled days, which is legitimate -- one valid day anywhere in the '
             f'record is enough to write a tile'
         )
+
+    if len(written_grids) > 1:
+        trace_absent_tiles(report, dataset, index, written_grids, chunks, args)
 
     report.note(
         f'{total_bytes / 1024**4:.3f} TiB compressed across the data chunks, '
@@ -968,7 +1180,7 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
     )
 
 
-def check_identities(report, dataset, index, args, chunks, layout):
+def check_identities(report, dataset, index, variables, args, chunks, layout):
     """Check GLEAM's component sums, against raw where they do not close.
 
     A sum that closes to float32 rounding can only do so if every component
@@ -982,24 +1194,35 @@ def check_identities(report, dataset, index, args, chunks, layout):
         report (Report): Where to record outcomes.
         dataset (xarray.Dataset): The decoded store.
         index (dict): The raw index.
+        variables (list): Variable names.
         args (argparse.Namespace): Parsed arguments.
         chunks (dict): Resolved chunk sizes.
         layout (str): From ``store_layout``.
     """
     rng = np.random.default_rng(args.seed)
-    spots = sample_spots(dataset, chunks, layout, rng, args.identity_days)
+    spots = sample_spots(
+        dataset, index, variables, chunks, layout, rng, args.identity_days
+    )
 
     for total_name, components in IDENTITIES:
         if total_name not in dataset.data_vars or not all(
             c in dataset.data_vars for c in components
         ):
             continue
+        tested = 0
         for t0, t1, lat, lon in spots:
             select = dict(time=slice(t0, t1), lat=lat, lon=lon)
             total = dataset[total_name].isel(**select).values
             if not np.isfinite(total).any():
-                # nothing but fill here, so there is no identity to close
+                # nothing but fill here, so there is no identity to close. The
+                # count below is what keeps a draw that lands entirely on ocean
+                # from reporting success having tested nothing
+                report.note(
+                    f'{total_name} is all fill at '
+                    f'{describe_box(dataset, t0, t1, lat, lon)}, nothing to close'
+                )
                 continue
+            tested += 1
             summed = sum(dataset[name].isel(**select).values for name in components)
             residual = np.abs(total - summed)
             valid = np.isfinite(total) & np.isfinite(summed)
@@ -1042,6 +1265,12 @@ def check_identities(report, dataset, index, args, chunks, layout):
                 f'the store matches raw'
             )
 
+        report.check(
+            f'{total_name} identity tested somewhere that holds data',
+            tested > 0,
+            f'{tested} of {len(spots)} sampled positions held data',
+        )
+
 
 def check_ranges(report, dataset, index, variables, args, chunks, layout):
     """Check physical bounds, and report how the valid footprint moves.
@@ -1061,28 +1290,41 @@ def check_ranges(report, dataset, index, variables, args, chunks, layout):
         layout (str): From ``store_layout``.
     """
     rng = np.random.default_rng(args.seed)
-    spots = sample_spots(dataset, chunks, layout, rng, args.range_days)
+    spots = sample_spots(
+        dataset, index, variables, chunks, layout, rng, args.range_days
+    )
 
     for name in variables:
         units = dataset[name].attrs.get('units')
         bounds = BOUNDS_BY_UNITS.get(units)
-        counts, lows, highs = [], [], []
+        counts, cells, lows, highs = [], [], [], []
         for t0, t1, lat, lon in spots:
             values = dataset[name].isel(time=slice(t0, t1), lat=lat, lon=lon).values
             finite = np.isfinite(values)
             counts.append(int(finite.sum()))
+            cells.append(int(values.size))
             if finite.any():
                 lows.append(float(np.min(values[finite])))
                 highs.append(float(np.max(values[finite])))
 
+        # a bound holds trivially over cells that are all NaN, so whether the
+        # draw found any data is a finding in its own right rather than a
+        # precondition to assume
+        report.check(
+            f'{name:9s} at least one sampled box holds data',
+            bool(lows),
+            f'{sum(1 for c in counts if c)} of {len(spots)} boxes hold data',
+        )
         if bounds is None:
             report.note(f'{name} has units {units!r} with no bounds to check')
             continue
+        if not lows:
+            continue
         low, high = bounds
-        observed = (min(lows), max(highs)) if lows else (np.nan, np.nan)
+        observed = (min(lows), max(highs))
         report.check(
             f'{name:9s} within [{low:g}, {high:g}] {units}',
-            not lows or (observed[0] >= low and observed[1] <= high),
+            observed[0] >= low and observed[1] <= high,
             f'observed [{observed[0]:.4g}, {observed[1]:.4g}] over {len(spots)} boxes',
         )
 
@@ -1093,7 +1335,7 @@ def check_ranges(report, dataset, index, variables, args, chunks, layout):
             report.note(
                 f'{name} valid cells per sampled box: '
                 f'{min(counts)}..{max(counts)} of '
-                f'{values.size} ({len(spots)} boxes)'
+                f'{max(cells)} ({len(spots)} boxes)'
             )
             continue
 
@@ -1112,6 +1354,84 @@ def check_ranges(report, dataset, index, variables, args, chunks, layout):
             )
         else:
             report.note(f'{name} valid footprint is static at {counts[0]} cells')
+
+
+def check_metadata(report, dataset, other_settings):
+    """Compare a store's metadata against a sibling store's.
+
+    Two stores built from the same raw files hold the same data and must
+    describe it the same way. Almost everything they carry is either taken
+    straight from the source files or is shared prose from the config, so a
+    difference is a defect -- the exceptions are the handful of attributes that
+    describe the layout, the build or what has been proven about it, which are
+    reported side by side instead of asserted. Metadata and three coordinate
+    arrays, so it costs seconds however large the stores are.
+
+    Args:
+        report (Report): Where to record outcomes.
+        dataset (xarray.Dataset): The decoded store being verified.
+        other_settings (dict): The loaded configuration of the store to compare
+            against.
+    """
+    path = store_path(other_settings)
+    LOG.info(f'comparing metadata against {path}')
+    repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
+    other = xr.open_zarr(
+        repository.readonly_session(branch=BRANCH).store, consolidated=False
+    )
+
+    here, there = set(dataset.data_vars), set(other.data_vars)
+    report.check(
+        'both stores hold the same variables',
+        here == there,
+        f'{len(here)} here, {len(there)} there'
+        + (f'; only here {sorted(here - there)}' if here - there else '')
+        + (f'; only there {sorted(there - here)}' if there - here else ''),
+    )
+
+    mismatched = []
+    for name in sorted(here & there):
+        if dataset[name].dims != other[name].dims:
+            mismatched.append(f'{name} dims')
+        if dataset[name].dtype != other[name].dtype:
+            mismatched.append(f'{name} dtype')
+        differing = sorted(
+            key
+            for key in set(dataset[name].attrs) | set(other[name].attrs)
+            if dataset[name].attrs.get(key) != other[name].attrs.get(key)
+        )
+        if differing:
+            mismatched.append(f'{name} attrs {differing}')
+    report.check(
+        'every shared variable has identical dims, dtype and attributes',
+        not mismatched,
+        f'{len(here & there)} variables compared'
+        + (f'; differing {mismatched[:5]}' if mismatched else ''),
+    )
+
+    for coordinate in ('time', 'lat', 'lon'):
+        mine, theirs = dataset[coordinate].values, other[coordinate].values
+        report.check(
+            f'{coordinate:9s} coordinate identical in both stores',
+            mine.shape == theirs.shape and np.array_equal(mine, theirs),
+            f'{mine.size} values here, {theirs.size} there',
+        )
+
+    keys = (set(dataset.attrs) | set(other.attrs)) - LAYOUT_ATTRS
+    differing = sorted(
+        key for key in keys if dataset.attrs.get(key) != other.attrs.get(key)
+    )
+    report.check(
+        'global attributes outside the layout-specific ones are identical',
+        not differing,
+        f'{len(keys)} compared, {len(LAYOUT_ATTRS)} exempt'
+        + (f'; differing {differing}' if differing else ''),
+    )
+    for key in sorted(LAYOUT_ATTRS & (set(dataset.attrs) | set(other.attrs))):
+        report.note(
+            f'{key}: here {str(dataset.attrs.get(key, "<absent>")):.90} | '
+            f'there {str(other.attrs.get(key, "<absent>")):.90}'
+        )
 
 
 def check_repository(report, repository, dataset, settings):
@@ -1180,12 +1500,15 @@ def main(settings, args):
         int: 0 if every check passed, 1 otherwise.
 
     Raises:
-        ValueError: If --phases names something that is not a phase.
+        ValueError: If --phases names something that is not a phase, or names
+            the metadata phase without a store to compare against.
     """
     phases = [p.strip() for p in args.phases.split(',') if p.strip()]
     unknown = [p for p in phases if p not in PHASES]
     if unknown:
         raise ValueError(f'unknown phases {unknown}; choose from {list(PHASES)}')
+    if 'metadata' in phases and not args.compare_with:
+        raise ValueError('the metadata phase needs --compare-with <config>')
 
     report = Report()
     variables = resolve_variables(settings)
@@ -1197,10 +1520,11 @@ def main(settings, args):
     layout = store_layout(chunks, dataset.sizes)
     LOG.info(f'phases: {phases}, chunks {chunks}, layout {layout!r}')
 
-    # every phase but 'structure' traces store values back to a raw file
+    # every phase but 'structure' and 'metadata' traces store values back to a
+    # raw file
     index = (
         build_raw_index(settings, variables)
-        if set(phases) - {'structure'}
+        if set(phases) - {'structure', 'metadata'}
         else {}
     )
 
@@ -1213,7 +1537,9 @@ def main(settings, args):
         check_index(report, dataset, index, variables)
     if 'samples' in phases:
         LOG.info('--- samples')
-        check_samples(report, dataset, index, variables, args, chunks, layout)
+        check_samples(
+            report, dataset, index, variables, args, chunks, layout, settings
+        )
     if 'sweep' in phases:
         LOG.info('--- sweep')
         asyncio.run(
@@ -1223,10 +1549,13 @@ def main(settings, args):
         )
     if 'identities' in phases:
         LOG.info('--- identities')
-        check_identities(report, dataset, index, args, chunks, layout)
+        check_identities(report, dataset, index, variables, args, chunks, layout)
     if 'ranges' in phases:
         LOG.info('--- ranges')
         check_ranges(report, dataset, index, variables, args, chunks, layout)
+    if 'metadata' in phases:
+        LOG.info('--- metadata')
+        check_metadata(report, dataset, load_config(args.compare_with))
 
     LOG.info(f'{report.n_checks} checks, {len(report.failures)} failures')
     if report.failures:
@@ -1240,7 +1569,12 @@ def main(settings, args):
 if __name__ == '__main__':
     arguments = parse_args()
     configuration = load_config(arguments.config)
+    # named after the store's own log file, so two stores' forensics do not
+    # interleave in one file
     setup_logging(
-        os.path.join(configuration['directories']['logs'], 'verify_gleam_zarr.log')
+        os.path.join(
+            configuration['directories']['logs'],
+            f'verify_{configuration["log_file"]}',
+        )
     )
     sys.exit(main(configuration, arguments))

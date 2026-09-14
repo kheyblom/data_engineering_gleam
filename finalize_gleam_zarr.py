@@ -358,7 +358,12 @@ def main(settings, args):
 if __name__ == '__main__':
     arguments = parse_args()
     configuration = load_config(arguments.config)
+    # named after the store's own log file, so two stores' forensics do not
+    # interleave in one file
     setup_logging(
-        os.path.join(configuration['directories']['logs'], 'finalize_gleam_zarr.log')
+        os.path.join(
+            configuration['directories']['logs'],
+            f'finalize_{configuration["log_file"]}',
+        )
     )
     sys.exit(main(configuration, arguments))
