@@ -38,7 +38,10 @@ uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml -
 uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --gc
 ```
 
-There is no test suite, linter, or CI configured; the
+There is an end to end test, `validation/test_pipeline.py`, which runs on a
+miniature fixture (`validation/stage_fixture.py` subsets the real raw files to a
+100x200 window) in about two minutes on a login node, spending no allocation.
+Run it after changing anything in the pipeline. There is no linter or CI; the
 notebook [draft_zarr.ipynb](draft_zarr.ipynb) is exploratory scratch work, not
 part of the pipeline. `verify_gleam_zarr.py` audits a *finished* store against
 the raw files — seven phases selectable with `--phases`, read only throughout,
@@ -307,27 +310,29 @@ does. Module docstrings carry the context needed to read the file.
 
 ### Layout
 
-Both entry points — `gleam_zarr.py` and `verify_gleam_zarr.py` — sit at the
-repo root, and `utils/` is importable only because a script's own directory is
-what lands on `sys.path`. That is why there is no install step, and it is the
-constraint any reorganisation runs into first: moving either script into a
-subdirectory breaks `from utils...` immediately.
+The three entry points — `gleam_zarr.py`, `verify_gleam_zarr.py` and
+`finalize_gleam_zarr.py` — sit at the repo root. `validation/` holds the
+developer tests, `stage_fixture.py` and `test_pipeline.py`.
 
-Considered and declined 2026-09-10, at one validation script: a subdirectory
-would mean adding `[build-system]` to `pyproject.toml` so `uv sync` installs
-the project editable. Worth doing, but not for one file — **revisit when a
-second validation script is committed**, and name the directory `validation/`
-rather than `tests/`. This is not a pytest suite: it audits a 1 TiB artifact,
-needs the raw tree staged on GLADE, and runs for ~9 minutes, so anything that
-collects `tests/` would pick up a file that cannot run off Derecho.
+**Settled 2026-09-14.** The trigger set on 2026-09-10 was "a second validation
+script", and `test_pipeline.py` is it. `pyproject.toml` now carries a
+`[build-system]`, so `uv sync` installs the project editable and `from utils...`
+resolves from a subdirectory; without that, only the repo root works, because a
+script's own directory is what lands on `sys.path`.
 
-`finalize_gleam_zarr.py` (added 2026-09-10) is a **third** root-level entry
-point, and it does not change that decision: the trigger stated above is a
-second *validation* script, and this is not one. It sits at the root for the
-same reason the other two do.
+The move was **narrower than the original note implied**, and the difference is
+worth keeping straight. `verify_gleam_zarr.py` stayed at the root: it is an
+operational tool, run against production stores and named as a gate in the
+finalization procedure, not a developer test. `validation/` holds the things a
+person runs while changing the code; the root holds the things a person runs
+against the data. Moving the verifier would have rewritten every documented
+command to no end.
 
-Whichever way that goes, do not paper over the import with `sys.path.insert`.
+Do not paper over the import with `sys.path.insert`; that is what the build
+system is for. Note that the root scripts are *not* importable from
+`validation/` — only `utils` is installed — which is why `test_pipeline.py`
+drives them as subprocesses. That is the better test anyway: it exercises the
+command line, the exit status and the log rather than the functions behind them.
 
-Test configs stay in `config/` beside the production one — they are inputs to
-`gleam_zarr.py`, not to the verifier, and one home for all configs beats
-splitting them by purpose.
+Configs stay in `config/`, production and fixture alike — they are inputs to
+`gleam_zarr.py`, and one home for all of them beats splitting them by purpose.

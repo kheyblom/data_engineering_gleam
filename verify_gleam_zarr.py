@@ -116,20 +116,26 @@ IDENTITIES = (
     ('Ep', ('Ep_aero', 'Ep_rad')),
 )
 
-# the floor a written chunk's compressed size may not fall below. Zarr only
-# writes a chunk holding something other than fill, so a small chunk is not by
-# itself wrong -- what it cannot be is empty or truncated.
+# the floor a written chunk's compressed size may not fall below, as a fraction
+# of what the chunk holds uncompressed. Zarr only writes a chunk holding
+# something other than fill, so a small chunk is not by itself wrong -- what it
+# cannot be is empty or truncated.
 #
 # How much a floor is worth depends on the layout, because the smallest
-# legitimate chunk does. A global float32 plane of real geophysical data never
-# zstds under 50 KiB, so that floor catches a constant or truncated plane with
-# no false alarms. A 20x20 tile is a different matter: the smallest legitimate
-# one holds a single valid cell on a single day of 46 years, a few hundred
-# bytes of signal in an ocean of NaN, so any floor above zero would report
-# sparse coastal tiles as damage. There the floor is only 'not empty', and the
-# real anti-truncation check is to read the smallest chunks back and compare
-# them against raw -- measured rather than assumed.
-DEGENERATE_BYTES = {'spatial': 50 * 1024, 'temporal': 0}
+# legitimate chunk does. A float32 plane of real geophysical data never zstds
+# below about 0.2% of its size, which on the production grid is the 50 KiB this
+# was first written as. It is a *fraction* rather than that number because an
+# absolute floor is a statement about one grid: on a 100 x 200 test window a
+# perfectly good chunk is 33 KB, and the check cried damage on a correct store
+# until the fixture caught it.
+#
+# A 20x20 tile is a different matter: the smallest legitimate one holds a single
+# valid cell on a single day of 46 years, a few hundred bytes of signal in an
+# ocean of NaN, so any floor above zero would report sparse coastal tiles as
+# damage. There the floor is only 'not empty', and the real anti-truncation
+# check is to read the smallest chunks back and compare them against raw --
+# measured rather than assumed.
+DEGENERATE_FRACTION = {'spatial': 0.002, 'temporal': 0.0}
 
 PHASES = (
     'structure', 'index', 'samples', 'sweep', 'identities', 'ranges', 'metadata'
@@ -1110,7 +1116,12 @@ async def check_sweep(
     grid = tile_grid(chunks, sizes)
     n_time_chunks = -(-n_time // chunks['time'])
     n_grid = n_time_chunks * grid[0] * grid[1]
-    floor = DEGENERATE_BYTES[layout]
+    # the chunk's own logical size, so the floor means the same thing on a test
+    # window as it does on the production grid
+    chunk_bytes = (
+        chunks['time'] * chunks['lat'] * chunks['lon'] * dataset[variables[0]].dtype.itemsize
+    )
+    floor = int(DEGENERATE_FRACTION[layout] * chunk_bytes)
     total_bytes = 0
     written_grids = {}
 
@@ -1156,7 +1167,7 @@ async def check_sweep(
         degenerate = [coordinates[k] for k in np.flatnonzero(chunk_sizes <= floor)]
         report.check(
             f'{name:9s} no written chunk is degenerate or truncated '
-            f'(> {floor / 1024:g} KiB)',
+            f'(> {floor / 1024:.3g} KiB, {DEGENERATE_FRACTION[layout]:.1%} of a chunk)',
             not degenerate,
             f'compressed min={chunk_sizes.min() / 1024**2:.3f} '
             f'median={np.median(chunk_sizes) / 1024**2:.3f} '
@@ -1364,7 +1375,9 @@ def check_identities(report, dataset, index, variables, args, chunks, layout, se
         sources = identity_sources(report, dataset, settings, total_name, components)
         if sources is None:
             continue
-        if sources[total_name] is not dataset:
+        # the total is always this store's own; what makes it a cross-store read
+        # is the components, so that is what decides whether to say so
+        if any(source is not dataset for source in sources.values()):
             report.note(f'{total_name} identity read across {len(sources)} stores')
         tested = 0
         for t0, t1, lat, lon in spots:

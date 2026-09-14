@@ -1,0 +1,48 @@
+# The map-chunked half of the pipeline test fixture: a 100 x 200 window of four
+# real variables over two years, written by validation/stage_fixture.py. Every
+# path key differs from production, so this can never address a real store.
+#
+# A subset rather than symlinks to whole files, deliberately: at the full grid a
+# build is minutes per variable and the test matrix needs a batch job, and a
+# test that needs qsub stops being run. See TESTING.md.
+directories:
+  download: /glade/derecho/scratch/kheyblom/data/gleam_fixture/
+  logs: ./logs
+output_conventions:
+  # one store per variable, as production; the layout is the directory
+  filename: '{suffix}/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr'
+  # not 'spatial': the fixture tree already isolates these by directory, but a
+  # distinct name means a mistyped path cannot quietly resolve to a real store
+  suffix: fixture_spatial
+log_file: gleam_zarr_fixture_spatial.log
+version: v4.3a
+# 'all' expands against the staged tree: E, Ep, Ep_aero, Ep_rad
+variables: all
+temporal_resolution: daily
+grid_name: native_0p1x0p1
+chunks:
+  time: 1
+  lat: -1
+  lon: -1
+# 731 staged timesteps give 7 full batches and a 31 step final one, so the short
+# final batch is exercised rather than assumed
+timesteps_per_commit: 100
+num_workers: 1
+file_cache_maxsize: 8
+chunk_cache_size_mib: 64
+
+attrs:
+  Conventions: ACDD-1.3
+  comment: >-
+    TEST FIXTURE -- a 100 x 200 window of GLEAM {version_label} over two years,
+    built by validation/test_pipeline.py. Not data.
+  # title and summary are deliberately absent: they are derived per variable by
+  # describe_variable, and this fixture exists partly to check that they are
+
+# exercises the per-variable attribute path; the text is fixture nonsense on
+# purpose, so a real note can never be confused for this one
+variable_attrs:
+  E:
+    known_data_gaps: >-
+      TEST FIXTURE attribute for {variable}, proving variable_attrs reaches the
+      store it names and no other.

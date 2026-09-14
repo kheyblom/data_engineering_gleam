@@ -65,7 +65,7 @@ and full `lat`/`lon` slab reads did not.
 - The **same** numpy 2.5.3 is clean on Python 3.13 and 3.12.
 
 **Fix:** `requires-python = ">=3.13,<3.14"`. Do not raise that cap without
-re-running `config/config_zarr_tiny.yaml`.
+re-running the tier 1 config (now `config/config_zarr_fixture_spatial.yaml`).
 
 ### 2. ~14x wasted decompression — the dominant cost
 
@@ -193,7 +193,7 @@ stale netCDF encoding surviving.
 | `utils/zarr_utils.py` | `chunk_cache_size_mib` applied in `configure_runtime` (finding 2) |
 | `config/config_zarr.yaml` (now `config_zarr_spatial.yaml`) | `chunk_cache_size_mib: 512`, `num_workers: 4` |
 | `submit_gleam_zarr.sh` | `QUEUE`/`NCPUS`/`MEM`/`WALLTIME`/`AFTER` overrides; affinity-based guard (finding 6) |
-| `config/config_zarr_tiny.yaml` | new — tier 1 config against a staged tree |
+| `config/config_zarr_tiny.yaml` | new — tier 1 config against a staged tree (superseded 2026-09-14 by the fixture configs) |
 | `config/config_zarr_bench.yaml` | new — throwaway store for timing runs |
 | `CLAUDE.md`, `README.md` | corrected chunk figures, documented the new key and the guard |
 
@@ -938,6 +938,79 @@ rebuilding 2 TiB to test a refactor would be the most expensive way to learn
 nothing. What a rebuild *would* write was checked instead, by rendering the
 attributes a production config produces against a built store.
 
+## A repeatable test (2026-09-14)
+
+Everything above was checked by hand, which catches nothing later.
+`validation/test_pipeline.py` runs the same ground in about two minutes: it
+builds both layouts from a fixture, verifies all eight stores against raw, and
+exercises the guards. 18 cases, non-zero exit on any failure.
+
+### 21. A faithful fixture nobody runs is worth less than a small one
+
+Tier 1 used to be symlinks to whole year files at the full 1800x3600 grid,
+staged by a script that was never committed -- so the fixture could not be
+recreated from the repo, and its config comments had drifted from the tree they
+described (they claimed E and SMs at 366 timesteps; the tree held E and Ec at
+731).
+
+`validation/stage_fixture.py` replaces it by subsetting the real files: four
+variables, two years, a 100 x 200 window, 72 MB, staged in under a minute and
+byte-identical to the source window with every attribute, the -999 sentinel and
+the 12-deep time chunking preserved. Three choices in it are load-bearing:
+
+- **The window holds land and ocean** (48% land, around 40N..30N by 0..20E).
+  An all-land window never leaves an ocean tile absent, and absent tiles are
+  much of what there is to check.
+- **100 x 200 is a whole number of 20 x 20 chunks.** The verifier skips its
+  absent-chunk checks outright when the grid is not, so the wrong window would
+  have produced a fixture that silently skipped the checks it exists for.
+- **Ep, Ep_aero and Ep_rad** make the component identity checkable *across*
+  sibling stores, and `E` is present as a total whose components are not, which
+  is the case that has to skip gracefully rather than fail.
+
+### 22. The test found two real bugs on its first run
+
+Both were invisible to every check run by hand, and both are the kind that only
+a second scale or a second reader exposes.
+
+**The degenerate-chunk floor was a statement about one grid.** `DEGENERATE_BYTES`
+was a flat 50 KiB, calibrated as "a global float32 plane never zstds below
+this". On the 100 x 200 fixture a perfectly good chunk is 33 KB, so the check
+cried damage on a correct store. It is now a *fraction* of the chunk's logical
+size, 0.2%, which is the same 50.6 KiB on the production grid and scales
+everywhere else. Re-checked against a production store: same verdict, same
+numbers.
+
+**The cross-store identity note was dead code.** It was written as
+
+```python
+if sources[total_name] is not dataset:      # never true
+```
+
+but the total always comes from the store under test -- what makes the read
+cross-store is the *components*. The note never fired, so the log said nothing
+about a check that was in fact running. Caught only because the test asserts on
+what a run reports, not merely on its exit status: a phase that silently checks
+nothing exits 0 just as happily as one that works.
+
+### 23. Proving a test can fail is part of writing it
+
+The first deliberate break -- downgrading `check_time_axis`'s size branch from a
+raise to a warning -- did not turn the test red, and that was correct: the
+second branch still raised, the build still refused, and nothing was written.
+The test asserts behaviour rather than internals, so it passed because the
+behaviour was still right.
+
+Disabling the guard outright did turn it red, on exactly the right case and with
+a message that says what went wrong:
+
+```
+FAIL  a short variable raises before anything is written  exit 0, no store created: False
+```
+
+The same reasoning as the guard in finding 20: a check nobody has watched fail
+is not known to work.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
@@ -987,7 +1060,7 @@ are, and both isolate their store by path, so neither can touch production:
 
 ```bash
 # tier 1: stage 2 variables x 1 year as symlinks, then build to completion
-uv run python gleam_zarr.py --config config/config_zarr_tiny.yaml
+uv run python gleam_zarr.py --config config/config_zarr_fixture_spatial.yaml
 
 # tier 3a: real input, throwaway store under a 'bench' suffix
 uv run python gleam_zarr.py --config config/config_zarr_bench.yaml

@@ -234,7 +234,7 @@ published, and the build refuses to touch it without `--force`:
 
 ```bash
 uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml --variable E
-uv run python gleam_zarr.py --config config/config_zarr_tiny.yaml
+uv run python gleam_zarr.py --config config/config_zarr_fixture_spatial.yaml
 ```
 
 A full build is far too heavy for a login node, so **submit it as a batch job**
@@ -252,7 +252,7 @@ VARIABLE=E ./submit_gleam_zarr.sh                       # one store only
 
 # a short test on the shared develop queue, billed for the cpus it asks for
 QUEUE=develop NCPUS=8 WALLTIME=00:30:00 \
-    CONFIG=config/config_zarr_tiny.yaml ./submit_gleam_zarr.sh
+    CONFIG=config/config_zarr_fixture_spatial.yaml ./submit_gleam_zarr.sh
 
 # the region path needs memory rather than cpus: one block is held whole, and
 # a shared develop job gets a flat 10 GB default whatever ncpus it asked for
@@ -291,6 +291,26 @@ commit. Resubmitting after a completed run is a no-op.
 
 Progress goes to both stdout and `<directories.logs>/<log_file>`; PBS job output
 lands in `logs/` as well. Logs and all data outputs are gitignored.
+
+## Testing
+
+The pipeline has an end to end test that runs on a miniature fixture: four real
+variables over two years on a 100x200 window, subset out of the raw files by
+`validation/stage_fixture.py`. It builds both layouts, verifies every store
+against raw, and exercises the guards — the time-axis check, resume, and the
+refusal to rebuild a published store.
+
+```bash
+uv run python validation/stage_fixture.py     # once, ~1 minute, ~72 MB
+uv run python validation/test_pipeline.py     # ~2 minutes, exits non-zero on failure
+```
+
+It runs on a login node and spends no allocation. That is the point of the
+subset: the fixture it replaced was symlinks to whole year files, which made the
+same matrix a batch job, and a test that needs `qsub` is a test that stops being
+run. What a subset cannot tell you is anything about scale — memory, read
+amplification, walltime — which is what the `bench` configs and
+`verify_gleam_zarr.py` against the real stores are for.
 
 ## Configuration
 
