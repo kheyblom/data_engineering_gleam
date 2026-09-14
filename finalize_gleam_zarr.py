@@ -71,6 +71,12 @@ def parse_args():
     parser.add_argument(
         '--config', required=True, help='Path to the YAML config for the store.'
     )
+    parser.add_argument(
+        '--variable',
+        default=None,
+        help='Finalize the store holding this one variable. The config names a '
+        'family of per-variable stores; this picks one of them.',
+    )
     # one action per run: chaining them would hide which one failed
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument(
@@ -338,6 +344,9 @@ def main(settings, args):
     Returns:
         int: 0 if the action succeeded, 1 otherwise.
     """
+    if args.variable:
+        # renders the family's filename template for this one store
+        settings['variable'] = args.variable
     path = store_path(settings)
     LOG.info(f'finalizing {path}')
     if not args.apply and not args.status:

@@ -208,6 +208,14 @@ def parse_args():
         '--config', type=str, required=True, help='Path to YAML configuration file.'
     )
     parser.add_argument(
+        '--variable',
+        type=str,
+        default=None,
+        help='Verify the store holding this one variable. The config names the '
+        'whole family of 14, which is what the checks that read across stores '
+        'need; this names the one store being checked.',
+    )
+    parser.add_argument(
         '--phases',
         type=str,
         default=','.join(DEFAULT_PHASES),
@@ -287,6 +295,49 @@ def open_store(settings):
     repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
     session = repository.readonly_session(branch=BRANCH)
     return repository, session, xr.open_zarr(session.store, consolidated=False)
+
+
+def sibling_session(settings, variable):
+    """Open another variable's store of the same family, read only.
+
+    The family shares one filename template, so a sibling's path is the same
+    template rendered with a different variable -- there is no second naming
+    convention to keep in step.
+
+    Args:
+        settings (dict): The loaded configuration.
+        variable (str): The variable whose store to open.
+
+    Returns:
+        icechunk.Session: A read-only session, or None if that store is absent.
+    """
+    path = store_path({**settings, 'variable': variable})
+    if not os.path.exists(path):
+        return None
+    repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
+    return repository.readonly_session(branch=BRANCH)
+
+
+def ensure_indexed(index, settings, variables):
+    """Extend the raw index with any of these variables it does not hold.
+
+    The index is built for the store under test, which on a per-variable store
+    is one variable. A check that falls back to raw for other variables -- the
+    identities do, where a sum does not close -- pays for those files only if it
+    actually needs them.
+
+    Args:
+        index (dict): The raw index, modified in place.
+        settings (dict): The loaded configuration.
+        variables (list): Variable names the caller is about to read.
+
+    Returns:
+        dict: The index.
+    """
+    missing = [name for name in variables if name not in index]
+    if missing:
+        index.update(build_raw_index(settings, missing))
+    return index
 
 
 def build_raw_index(settings, variables):
@@ -931,7 +982,33 @@ def check_samples(report, dataset, index, variables, args, chunks, layout, setti
     )
 
 
-def trace_absent_tiles(report, dataset, index, written, chunks, args):
+async def sibling_written_grids(settings, variables, grid):
+    """Which tiles each sibling variable's store actually wrote.
+
+    Read off each store's manifest, so a 14-store union costs metadata reads
+    and no data I/O at all.
+
+    Args:
+        settings (dict): The loaded configuration.
+        variables (list): Sibling variable names to look up.
+        grid (tuple): Number of chunks along lat and lon.
+
+    Returns:
+        dict: Variable name -> boolean tile grid, skipping absent stores.
+    """
+    grids = {}
+    for name in variables:
+        session = sibling_session(settings, name)
+        if session is None:
+            continue
+        written = np.zeros(grid, dtype=bool)
+        async for coordinate in session.chunk_coordinates(f'/{name}'):
+            written[coordinate[1], coordinate[2]] = True
+        grids[name] = written
+    return grids
+
+
+def trace_absent_tiles(report, dataset, index, written, chunks, args, only=None):
     """Settle the absent tiles that another variable did write.
 
     The sweep justifies an absent tile against a handful of sampled raw planes,
@@ -950,6 +1027,8 @@ def trace_absent_tiles(report, dataset, index, written, chunks, args):
         written (dict): Variable name -> boolean tile grid of written chunks.
         chunks (dict): Resolved chunk sizes.
         args (argparse.Namespace): Parsed arguments.
+        only (list): Variables to trace, when the others are siblings that are
+            only here to supply the union. Default is all of them.
     """
     sizes = dataset.sizes
     union = np.zeros(next(iter(written.values())).shape, dtype=bool)
@@ -959,11 +1038,15 @@ def trace_absent_tiles(report, dataset, index, written, chunks, args):
     suspect = {
         name: np.argwhere(union & ~tiles) for name, tiles in written.items()
     }
-    pending = {name: tiles for name, tiles in suspect.items() if len(tiles)}
+    pending = {
+        name: tiles
+        for name, tiles in suspect.items()
+        if len(tiles) and (only is None or name in only)
+    }
     if not pending:
         report.note(
-            'every variable wrote every tile any other variable wrote, so no '
-            'absent tile needs tracing'
+            f'no absent tile needs tracing: every tile written by any of the '
+            f'{len(written)} variables was written here too'
         )
         return
 
@@ -988,7 +1071,9 @@ def trace_absent_tiles(report, dataset, index, written, chunks, args):
         )
 
 
-async def check_sweep(report, session, dataset, index, variables, chunks, layout, args):
+async def check_sweep(
+    report, session, dataset, index, variables, chunks, layout, args, settings, family
+):
     """Check every chunk in the store for presence, placement and size.
 
     Runs off the manifest rather than by reading data, so it covers the whole
@@ -1014,6 +1099,10 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
         chunks (dict): Resolved chunk sizes.
         layout (str): From ``store_layout``.
         args (argparse.Namespace): Parsed arguments.
+        settings (dict): The loaded configuration.
+        family (list): Every variable of the family, which on a per-variable
+            store is where the absent-tile trace finds something to compare
+            against.
     """
     sizes = dataset.sizes
     n_time = sizes['time']
@@ -1163,8 +1252,30 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
             f'record is enough to write a tile'
         )
 
-    if len(written_grids) > 1:
-        trace_absent_tiles(report, dataset, index, written_grids, chunks, args)
+    if written_grids:
+        # one variable per store leaves nothing here to compare against, so the
+        # union is taken from the sibling stores' manifests instead. It is the
+        # same check either way: a tile some other variable wrote and this one
+        # did not is the only kind of hole worth reading raw to settle
+        variable = settings.get('variable')
+        if variable is not None:
+            siblings = await sibling_written_grids(
+                settings, [name for name in family if name != variable], grid
+            )
+            report.note(
+                f'absent-tile union taken from {len(siblings)} sibling stores'
+            )
+            trace_absent_tiles(
+                report,
+                dataset,
+                index,
+                {**written_grids, **siblings},
+                chunks,
+                args,
+                only=list(written_grids),
+            )
+        elif len(written_grids) > 1:
+            trace_absent_tiles(report, dataset, index, written_grids, chunks, args)
 
     report.note(
         f'{total_bytes / 1024**4:.3f} TiB compressed across the data chunks, '
@@ -1180,7 +1291,51 @@ async def check_sweep(report, session, dataset, index, variables, chunks, layout
     )
 
 
-def check_identities(report, dataset, index, variables, args, chunks, layout):
+def identity_sources(report, dataset, settings, total_name, components):
+    """Where to read each side of an identity from.
+
+    On an all-variable store every side is in the store under test. On a
+    per-variable store the components live in sibling stores, and only the
+    store holding the *total* runs the check -- the component stores would each
+    repeat the identical comparison.
+
+    Args:
+        report (Report): Where to record outcomes.
+        dataset (xarray.Dataset): The store under test.
+        settings (dict): The loaded configuration.
+        total_name (str): Left-hand side of the identity.
+        components (tuple): Right-hand side.
+
+    Returns:
+        dict: Variable name -> the dataset holding it, or None if this store
+            should not run this identity or a store is missing.
+    """
+    variable = settings.get('variable')
+    if variable is not None and total_name != variable:
+        return None
+
+    sources, missing = {}, []
+    for name in (total_name, *components):
+        if name in dataset.data_vars:
+            sources[name] = dataset
+            continue
+        if variable is None:
+            # an all-variable store simply does not hold this identity
+            return None
+        session = sibling_session(settings, name)
+        if session is None:
+            missing.append(name)
+        else:
+            sources[name] = xr.open_zarr(session.store, consolidated=False)
+    if missing:
+        report.note(
+            f'{total_name} identity not checked: no store found for {missing}'
+        )
+        return None
+    return sources
+
+
+def check_identities(report, dataset, index, variables, args, chunks, layout, settings):
     """Check GLEAM's component sums, against raw where they do not close.
 
     A sum that closes to float32 rounding can only do so if every component
@@ -1198,6 +1353,7 @@ def check_identities(report, dataset, index, variables, args, chunks, layout):
         args (argparse.Namespace): Parsed arguments.
         chunks (dict): Resolved chunk sizes.
         layout (str): From ``store_layout``.
+        settings (dict): The loaded configuration, for finding sibling stores.
     """
     rng = np.random.default_rng(args.seed)
     spots = sample_spots(
@@ -1205,14 +1361,15 @@ def check_identities(report, dataset, index, variables, args, chunks, layout):
     )
 
     for total_name, components in IDENTITIES:
-        if total_name not in dataset.data_vars or not all(
-            c in dataset.data_vars for c in components
-        ):
+        sources = identity_sources(report, dataset, settings, total_name, components)
+        if sources is None:
             continue
+        if sources[total_name] is not dataset:
+            report.note(f'{total_name} identity read across {len(sources)} stores')
         tested = 0
         for t0, t1, lat, lon in spots:
             select = dict(time=slice(t0, t1), lat=lat, lon=lon)
-            total = dataset[total_name].isel(**select).values
+            total = sources[total_name][total_name].isel(**select).values
             if not np.isfinite(total).any():
                 # nothing but fill here, so there is no identity to close. The
                 # count below is what keeps a draw that lands entirely on ocean
@@ -1223,7 +1380,9 @@ def check_identities(report, dataset, index, variables, args, chunks, layout):
                 )
                 continue
             tested += 1
-            summed = sum(dataset[name].isel(**select).values for name in components)
+            summed = sum(
+                sources[name][name].isel(**select).values for name in components
+            )
             residual = np.abs(total - summed)
             valid = np.isfinite(total) & np.isfinite(summed)
             worst = float(np.max(residual[valid])) if valid.any() else 0.0
@@ -1241,6 +1400,9 @@ def check_identities(report, dataset, index, variables, args, chunks, layout):
             # recompute the identity from raw, decoded the same way, and see
             # whether the store's residual field is the raw one exactly
             raw_boxes = {}
+            # only now does raw for the other side matter, so only now is it
+            # indexed -- on a per-variable store that is 6 more variables' files
+            ensure_indexed(index, settings, (total_name, *components))
             for name in (total_name, *components):
                 box = read_raw_box(index, name, t0, t1, lat, lon)
                 box[box == RAW_FILL] = np.nan
@@ -1500,8 +1662,9 @@ def main(settings, args):
         int: 0 if every check passed, 1 otherwise.
 
     Raises:
-        ValueError: If --phases names something that is not a phase, or names
-            the metadata phase without a store to compare against.
+        ValueError: If --phases names something that is not a phase, names the
+            metadata phase without a store to compare against, or names a
+            variable the config's family does not hold.
     """
     phases = [p.strip() for p in args.phases.split(',') if p.strip()]
     unknown = [p for p in phases if p not in PHASES]
@@ -1511,7 +1674,16 @@ def main(settings, args):
         raise ValueError('the metadata phase needs --compare-with <config>')
 
     report = Report()
-    variables = resolve_variables(settings)
+    # the config names the family; --variable names the one store under test.
+    # Both are needed: the checks that read across stores resolve siblings from
+    # the family, and the store itself must hold exactly the one
+    family = resolve_variables(settings)
+    variables = family
+    if args.variable:
+        if args.variable not in family:
+            raise ValueError(f'{args.variable!r} is not in the family {family}')
+        settings['variable'] = args.variable
+        variables = [args.variable]
     repository, session, dataset = open_store(settings)
 
     # the chunking decides what a cheap read is, so it is resolved once here and
@@ -1544,18 +1716,33 @@ def main(settings, args):
         LOG.info('--- sweep')
         asyncio.run(
             check_sweep(
-                report, session, dataset, index, variables, chunks, layout, args
+                report,
+                session,
+                dataset,
+                index,
+                variables,
+                chunks,
+                layout,
+                args,
+                settings,
+                family,
             )
         )
     if 'identities' in phases:
         LOG.info('--- identities')
-        check_identities(report, dataset, index, variables, args, chunks, layout)
+        check_identities(
+            report, dataset, index, variables, args, chunks, layout, settings
+        )
     if 'ranges' in phases:
         LOG.info('--- ranges')
         check_ranges(report, dataset, index, variables, args, chunks, layout)
     if 'metadata' in phases:
         LOG.info('--- metadata')
-        check_metadata(report, dataset, load_config(args.compare_with))
+        other = load_config(args.compare_with)
+        if args.variable:
+            # the sibling layout holds the same variable in its own store
+            other['variable'] = args.variable
+        check_metadata(report, dataset, other)
 
     LOG.info(f'{report.n_checks} checks, {len(report.failures)} failures')
     if report.failures:
