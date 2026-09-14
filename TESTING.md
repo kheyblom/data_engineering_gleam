@@ -4,6 +4,13 @@ Record of the testing run on **2026-09-09**, before the first production build
 of the v4.3a daily store. Written down because most of what it found was not
 what it went looking for.
 
+**This file is in chronological order, and the deliverable changed underneath
+it.** Sections up to *Finalization (2026-09-10)* describe a single store holding
+all 14 variables; the two all-variable stores were split into 28 per-variable
+ones on 2026-09-13 and deleted on 2026-09-14. Figures in the early sections are
+correct for what existed when they were written, not for what is on disk now.
+The later sections carry the current numbers.
+
 The pipeline had never been run to completion — `logs/` was empty and no store
 existed. The goal was to prove it worked end to end, and to choose
 `timesteps_per_commit`, `num_workers` and `file_cache_maxsize` from
@@ -1026,14 +1033,14 @@ is not known to work.
   if wallclock ever becomes the binding constraint.
 - ~~**The 8.57 GiB of orphaned chunks was left in place.**~~ **Done
   2026-09-10**, and the reasoning that deferred it was wrong. See finding 9.
-- **The store lives on scratch, which is purged.** 1.041 TiB sitting in
-  `/glade/derecho/scratch` is subject to the purge policy; the campaign
-  allocation `/glade/campaign/univ/umic0112` has 5 TiB free and 0 used.
-  **Accepted, 2026-09-10**: the store stays on scratch for now and the move is
-  handled separately. `directories.raw` was added so a moved store can still be
-  verified against a raw tree that did not move with it, which is the coupling
-  the move runs into first. Until it moves, treat the store as reproducible
-  rather than archived.
+- **The stores live on scratch, which is purged.** Written when this was one
+  store of 1.041 TiB; it is now **28 stores totalling ~2.1 T**, beside ~1.7 TiB
+  of raw, all still on `/glade/derecho/scratch` and all still subject to the
+  purge policy. **Accepted, 2026-09-10 and again 2026-09-14**: the stores stay
+  on scratch, and a copy is taken to `/glade/campaign/univ/umic0112` as a backup
+  rather than moving them. `directories.raw` exists so a store read from
+  somewhere else can still be verified against a raw tree that did not move with
+  it, which is the coupling any move runs into first.
 - ~~**`chunks: {time: 1}` is the worst possible layout for point time-series
   reads**, which touch all 16802 chunks of a variable.~~ **Being addressed
   2026-09-11**: a second store chunked `(16802, 20, 20)` is built beside it
