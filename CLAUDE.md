@@ -5,25 +5,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 Converts raw GLEAM (evaporation/soil moisture) netCDF files into icechunk-backed
-zarr stores on NCAR Derecho/GLADE. One script, one config per store, no package
+zarr stores on NCAR Derecho/GLADE. One script, one config per layout, no package
 install step — `gleam_zarr.py` is run directly from the repo root.
 
-Two stores are built from the same raw files, differing only in chunking and so
-in which read is cheap: `spatial` (`1, 1800, 3600`, one global map per chunk) and
-`temporal` (`16802, 20, 20`, one 2x2 degree tile through the whole record).
-Neither is derived from the other — both are built from raw and verified against
-raw independently — so nothing about one has to be trusted to trust the other.
+The deliverable is **28 stores: one per variable, under each of two chunkings**
+— `spatial` (`1, 1800, 3600`, one global map per chunk) and `temporal`
+(`16802, 20, 20`, one 2x2 degree tile through the whole record). The layout is
+the directory, the variable is the filename, and one config addresses a whole
+layout with `--variable` picking the store within it.
+
+The two layouts are not derived from each other: each was built from raw and
+verified against raw independently, so nothing about one has to be trusted to
+trust the other. The per-variable stores were split from two all-variable stores
+(still on disk, superseded, pending deletion) and each was then verified against
+raw in its own right, so the split is not trusted either.
 
 ## Commands
 
 ```bash
 uv sync                                             # create/refresh .venv from uv.lock
 uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml
-uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E                                    # one store of the layout
 
 # finalization; writes nothing without --apply, one action per invocation.
 # --status first: it reports which steps a store still needs
-uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --status
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E --status
 uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --attrs
 uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --tag NAME
 uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --gc
@@ -36,7 +44,14 @@ the raw files — seven phases selectable with `--phases`, read only throughout,
 non-zero exit on any failure. Six run by default; `metadata` compares the
 store's attributes and coordinates against a sibling store's and needs
 `--compare-with <config>`, which is how two stores built from the same files
-are held to describing the same data the same way. It reads the store's chunking
+are held to describing the same data the same way. `--variable` picks which
+store of a layout to check, and the config's variable list then names the
+*family*: the two checks that need more than one variable — the GLEAM component
+identities and the absent-tile trace — read the sibling per-variable stores
+rather than dying with the split. Only the store holding a total runs that
+identity, so the check is not repeated fourteen times.
+
+It reads the store's chunking
 and follows it: the unit of comparison is a *box* that is one chunk of the store,
 a global plane in the spatial store and a 20x20 tile through the whole record in
 the temporal one. Reading the other layout's box is not a style question — one

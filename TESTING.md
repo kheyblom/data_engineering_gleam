@@ -756,6 +756,93 @@ it is to be replaced by one store per variable. Tagging it would permanently nam
 something not meant to be cited. The verification is recorded in the store's own
 attributes instead, which a later split can carry forward.
 
+## Splitting into per-variable stores, and verifying them (2026-09-14)
+
+The deliverable changed to one store per variable. Both all-variable stores were
+split into 14 stores each and all 28 were verified against raw and finalized.
+
+### The split: 17 core-hours per layout, not 85
+
+Copying from the finished stores rather than rebuilding from raw skips the
+netCDF decompression that the cost fit puts at ~97% of a build. Fourteen
+processes, one per variable, on `develop` at `ncpus=14`: **73 min for the
+temporal layout, 98 for the spatial**, against ~85 core-hours to rebuild both
+from the netCDF files. The per-variable stores are separate repositories, so the
+single-writer rule that forces a build into a chained job does not apply and the
+variables run in parallel with no coordination at all.
+
+### 16. Copying stored chunk bytes does not work
+
+The first attempt copied chunks as *stored bytes* through the zarr store API --
+same chunk grid, same codecs, so nothing would be decoded and every chunk would
+be bit-identical by construction. It is the obviously cheaper design and it does
+not survive contact with icechunk:
+
+| chunks copied | rate |
+| --- | --- |
+| first 2000 | 202/s |
+| next 2000 | 41/s |
+| next 2000 | 18/s |
+
+The rate collapses as the destination grows, whether the writes are committed in
+one session or in batches of 2000, because every commit rewrites a manifest
+holding every chunk reference written so far. A later run failed outright with
+`RepositoryNotFoundError` mid-commit. Going through the pipeline's own write
+path costs a decode and a re-encode per chunk and holds a steady rate, which is
+the only thing that matters at 2 TiB.
+
+Worth knowing for the same reason finding 9 was: **a first measurement on a
+login node can be 30x pessimistic.** The early figures here were taken at load
+59 with 40 users; the same code on a batch node ran at 177 MB/s per process,
+4.5 GiB blocks in 26 s.
+
+### 17. One variable per store strands two checks
+
+The component identity and the cross-variable absent-tile trace both read more
+than one variable, and the split leaves each store with one. The trace is the
+one with no substitute: it is what proves an absent chunk is empty across the
+whole record, and finding 15 added it precisely because the sampled planes
+cannot see a tile that holds data only on an unsampled day.
+
+Both were ported to read sibling stores, which the filename template makes cheap
+-- a sibling's path is the same template rendered with a different variable, so
+there is no second naming convention to keep in step. The trace takes its union
+from 13 sibling *manifests*, which is metadata only and costs about a second.
+The identity runs only from the store holding the total, so it is checked twice
+across the family rather than fourteen times.
+
+The split also multiplies what the same settings buy. `--trace-absent 24` was a
+budget shared over 10 variables in one store; per-variable it is 24 per store,
+so **240 whole-record traces against 20**. The temporal draw was cut to
+`--samples 12` to pay for that and still gives ~3x the all-variable coverage.
+
+### Verification and finalization outcome
+
+All 28 stores: **0 failures**, 26-33 checks per spatial store and 28-34 per
+temporal one (the `E` and `Ep` stores carry the extra identity checks). Two jobs
+of 14 processes, ~25 min wall each.
+
+The `Ep != Ep_aero + Ep_rad` non-closure on 76 cells of one tile reappeared
+exactly as the all-variable stores recorded it, now read across three separate
+stores, with the store still reproducing raw bit-for-bit.
+
+Then attrs, tag `v4.3a-verified-20260914`, and gc on each store. **The garbage
+collection is the cleanest measurement yet of what the two write strategies
+cost in litter:**
+
+| | per spatial store | per temporal store |
+| --- | --- | --- |
+| orphan snapshots | 169 | 0 |
+| orphan manifests | 507 | 0 |
+| orphan transaction logs | 169 | 0 |
+| chunks, bytes | 0, 0.00 GiB | 0, 0.00 GiB |
+
+One orphan snapshot per `to_icechunk` append commit, exactly as the append path
+produces them and the region path does not. **Zero chunks and zero bytes on
+every store** is the number that matters before an irreversible step: the
+collection could only ever have removed metadata. Every store then passed a
+re-audit of its whole manifest, and a second collection found nothing.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
@@ -819,17 +906,23 @@ seconds, which makes it a reasonable smoke test after any change to the
 encoding or chunking logic:
 
 ```bash
-# everything: ~10 minutes on a login node, one core, free
-uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml
+# everything, for one store of a layout: ~10-15 minutes on a login node, free.
+# The config names the layout; --variable names the store within it
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E
 
 # the metadata-only phases: seconds, and the sweep is the only full-coverage
 # check there is -- run this first after any rebuild
 uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
-    --phases structure,index,sweep
+    --variable E --phases structure,index,sweep
 
 # spend longer on value comparisons
 uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
-    --phases samples --samples 140 --seed 1
+    --variable E --phases samples --samples 140 --seed 1
+
+# the two layouts of one variable, held to describing the same data the same way
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --variable E --phases metadata --compare-with config/config_zarr_spatial.yaml
 ```
 
 It exits non-zero if any check fails, and writes to
@@ -838,8 +931,10 @@ It exits non-zero if any check fails, and writes to
 Finalization is separate, and writes nothing without `--apply`:
 
 ```bash
-uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml --gc
+uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml \
+    --variable E --gc
 ```
 
 Run either without `--apply` first — the output is exactly what the applied run

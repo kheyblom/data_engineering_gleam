@@ -2,7 +2,10 @@ directories:
   download: /glade/derecho/scratch/kheyblom/data/gleam/
   logs: ./logs
 output_conventions:
-  filename: gleam.{version}.{temporal_resolution}.{grid_name}.{suffix}.zarr
+  # one store per variable: the layout is the directory, the variable is the
+  # name. {variable} renders from the top-level key the scripts set from
+  # --variable, so one config addresses all 14 stores of a layout
+  filename: '{suffix}/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr'
   suffix: spatial
 log_file: gleam_zarr.log
 version: v4.3a
@@ -27,17 +30,6 @@ chunk_cache_size_mib: 512
 # Coverage and grid attributes are not here: derive_attrs reads them off the
 # data so they cannot drift from what was actually written.
 attrs:
-  title: >-
-    GLEAM {version_label} daily land evaporation and soil moisture,
-    native 0.1 degree global grid, 1980-2025
-  summary: >-
-    All 14 GLEAM {version_label} daily variables merged onto one time/lat/lon
-    grid and stored as a single icechunk-backed zarr store: actual (E),
-    potential (Ep) and open-water (Ew) evaporation, the aerodynamic (Ep_aero)
-    and radiative (Ep_rad) components of Ep, the components of E -- bare soil
-    (Eb), condensation (Ec), interception loss (Ei), snow sublimation (Es) and
-    transpiration (Et) -- sensible heat flux (H), evaporative stress (S), and
-    surface (SMs) and root-zone (SMrz) soil moisture.
   # ACDD rather than CF, deliberately: see cf_compliance
   Conventions: ACDD-1.3
   cf_compliance: >-
@@ -48,13 +40,8 @@ attrs:
     spelled 'mm.day-1' and 'm3.m-3', which udunits does not parse. Correcting
     them would mean diverging from upstream, so they are left as published.
   source: >-
-    GLEAM {version_label} daily netCDF files, 644 files covering 14 variables
-    x 46 years, one file per variable-year
-  history: >-
-    2026-09-09/2026-09-10: converted from the GLEAM netCDF files to this
-    icechunk-backed zarr store by gleam_zarr.py (data_engineering_gleam @
-    74a3eaa) in 169 append commits; 2026-09-10: global attributes added by
-    finalize_gleam_zarr.py
+    GLEAM {version_label} daily netCDF files: 46 files holding {variable}, one
+    per year, 1980-2025
   date_created: '2026-09-10T10:24:11Z'
   creator_name: Kyle Heyblom
   creator_email: heyblom@umich.edu
@@ -64,18 +51,23 @@ attrs:
   chunking: >-
     Chunked (time, lat, lon) = (1, 1800, 3600), float32, zstd: one whole global
     map per chunk, 24.7 MiB. Built for reading maps and fields. A point time
-    series is the worst case for this layout, touching all 16802 chunks of a
-    variable; if that access pattern matters, build a second store chunked
-    along time rather than reading this one that way.
-  known_data_gaps: >-
-    Variable E is entirely fill (NaN) on 25 days -- five 5-day blocks,
-    1982-02-05..02-09 and 1992-01-01..01-05, 03-21..03-25, 05-20..05-24 and
-    10-02..10-06 -- while every other variable, including E's own components,
-    has data on those days. This is a gap in upstream GLEAM {version_label},
-    not a conversion defect. Zarr does not write a chunk whose cells are all
-    fill, so E holds 16777 chunks against 16802 timesteps and that is correct.
+    series is the worst case for this layout, touching all 16802 chunks of this
+    store; for time series read the sibling
+    temporal/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr
+    instead, which holds the same data chunked (16802, 20, 20).
+  # title, summary, history, related_store and known_data_gaps are deliberately
+  # absent. Each store carries its own, written per variable when the
+  # all-variable store was split, and format_attrs lets a config value override
+  # the store -- so a value here would overwrite 14 correct per-variable
+  # attributes with a claim to hold fourteen variables.
+  #
+  # added only once the verifier had actually run against these stores. A store
+  # must not carry a claim it has not earned.
   verification: >-
-    Verified 2026-09-10 against the source netCDF files by verify_gleam_zarr.py:
-    103 checks, 0 failures across structure, index, samples, sweep (all 235228
-    chunks), component identities and physical ranges. Value comparisons are
-    bit-exact, not approximate.
+    Verified 2026-09-14 against the source netCDF files by verify_gleam_zarr.py:
+    structure, index, sampled value comparisons, a sweep of every chunk in this
+    store, physical ranges, and a metadata comparison against the {variable}
+    store in the other layout. 0 failures; value comparisons are bit-exact, not
+    approximate. Every absent chunk was traced to a raw plane that is entirely fill, so a chunk count below the timestep count is confirmed rather than assumed. The GLEAM component identities -- E against its six
+    components, Ep against its two -- are checked from the store holding the
+    total, which reads the component stores alongside it.
