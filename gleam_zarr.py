@@ -229,16 +229,62 @@ def write_region(repository, dataset, chunks, settings, variable):
     return write_by_region(repository, dataset, blocks, done)
 
 
-def build_store(settings, variable, reference):
+def check_not_published(repository, path, force):
+    """Refuse to rebuild a store that has already been published.
+
+    A tag is how a finished store is published here, so a store carrying one is
+    something a consumer may already be pinning. Rebuilding it is not a no-op on
+    the region path: resume matches blocks by their exact bounds, read back out
+    of the commit messages, so a store written with one ``block_shape`` and
+    rebuilt with another matches nothing and writes every block again.
+
+    The data would survive that -- the same values are written from the same raw
+    files, and the tag is immutable, so anything reading through the tag is
+    untouched. What would not survive is the store describing itself honestly:
+    the branch tip would carry a ``verification`` attribute earned by a snapshot
+    that is no longer the tip. A store must not carry a claim it has not earned,
+    so this stops rather than warns.
+
+    Args:
+        repository (icechunk.Repository): The repository about to be written.
+        path (str): Its path, for the message.
+        force (bool): Rebuild anyway.
+
+    Raises:
+        ValueError: If the store carries a tag and ``force`` is not set.
+    """
+    tags = list(repository.list_tags())
+    if not tags:
+        return
+    if force:
+        LOG.warning(
+            f'{os.path.basename(path)} carries {tags} and is being rebuilt '
+            f'anyway; re-verify and re-tag it afterwards, and note that its '
+            f'verification attribute describes the tagged snapshot, not this one'
+        )
+        return
+    raise ValueError(
+        f'{path} carries {tags}: it has been verified and published, and a '
+        f'rebuild would move the branch away from the snapshot that tag names '
+        f'while leaving its verification attribute behind. Pass --force to '
+        f'rebuild it anyway, or delete the store first'
+    )
+
+
+def build_store(settings, variable, reference, force=False):
     """Build the store holding one variable.
 
     Args:
         settings (dict): The loaded configuration, with ``variable`` set.
         variable (str): The variable to build.
         reference (str): The family's reference variable for the time axis check.
+        force (bool): Rebuild even a published store.
 
     Returns:
         str: The path written.
+
+    Raises:
+        ValueError: If the store is published and ``force`` is not set.
     """
     path = store_path(settings)
     LOG.info(f'writing to {path}')
@@ -247,6 +293,8 @@ def build_store(settings, variable, reference):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     repository = open_repository(path)
+    # a fresh store has no tags, so this only ever stops a rebuild
+    check_not_published(repository, path, force)
 
     if strategy == 'append':
         written = write_append(repository, dataset, chunks, settings)
@@ -257,15 +305,17 @@ def build_store(settings, variable, reference):
     return path
 
 
-def main(settings, variable=None):
+def main(settings, variable=None, force=False):
     """Build one store, or the layout's whole family.
 
     Args:
         settings (dict): The loaded configuration.
         variable (str): The single variable to build, or None for all of them.
+        force (bool): Rebuild stores that have already been published.
 
     Raises:
-        ValueError: If ``variable`` is not one of the family's.
+        ValueError: If ``variable`` is not one of the family's, or a store is
+            published and ``force`` is not set.
     """
     # expand 'variables: all' against what was actually downloaded. The family
     # is needed whichever is built: its first member is the reference every
@@ -299,7 +349,7 @@ def main(settings, variable=None):
     for name in building:
         # store_path renders the variable, so it is set before the path is built
         settings['variable'] = name
-        build_store(settings, name, reference)
+        build_store(settings, name, reference, force)
 
     LOG.info('done :-)')
 
@@ -322,6 +372,13 @@ if __name__ == '__main__':
         'the layout is built in turn, which is what a test config usually wants; '
         'a production run fans out one process per variable instead.',
     )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Rebuild even a store that carries a tag. A tagged store has been '
+        'verified and published, and a rebuild moves the branch away from the '
+        'snapshot the tag names.',
+    )
     args = parser.parse_args()
     settings = load_config(args.config)
-    main(settings, args.variable)
+    main(settings, args.variable, args.force)

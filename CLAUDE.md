@@ -181,6 +181,21 @@ one lat/lon block of the full record at a time, committing each.
   matches the new grid, so all of it is written again. The run warns and
   continues; coverage is still complete because every block not in `done` is
   written.
+- **The 14 temporal stores on disk are in that state already.** They were split
+  out in 20-row blocks, because 14 concurrent processes cannot each hold the
+  48 GB a 200-row block needs, while the config asks for `lat: 200` because that
+  is the right trade against the *raw* files (1.43x read amplification against
+  3.8x at 20 rows). Both were right for their job; neither matches the other. So
+  a rebuild of a temporal store resumes nothing and rewrites all 9 blocks —
+  ~2.5 h per variable. Do not read "region resume" as "a rerun is free" the way
+  it is on the append path, where resume is by timestep count and a finished
+  store really is a no-op.
+- `gleam_zarr.py` **refuses to build into a store that carries a tag** unless
+  `--force` is passed. A tag is how a finished store is published here, and the
+  damage from rebuilding one is not to the data — the same values are written
+  and the tag is immutable — but to the store's honesty: the branch tip would
+  carry a `verification` attribute earned by a snapshot that is no longer the
+  tip.
 - In the temporal layout a **large fraction of the chunk grid is legitimately
   absent**: a 20x20 tile that is ocean is all-fill for all 16802 timesteps, and
   zarr does not write it. Unlike the spatial store's 25 missing `E` chunks, this

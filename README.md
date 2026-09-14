@@ -229,7 +229,8 @@ uv sync
 
 A build produces one store per variable. Run it directly for a short test or a
 small subset — with `--variable` for a single store, without it for the layout's
-whole family, one at a time:
+whole family, one at a time. A store that already carries a tag has been
+published, and the build refuses to touch it without `--force`:
 
 ```bash
 uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml --variable E
