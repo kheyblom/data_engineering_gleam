@@ -191,7 +191,7 @@ stale netCDF encoding surviving.
 | --- | --- |
 | `pyproject.toml` | `requires-python = ">=3.13,<3.14"` (finding 1) |
 | `utils/zarr_utils.py` | `chunk_cache_size_mib` applied in `configure_runtime` (finding 2) |
-| `config/config_zarr.yaml` | `chunk_cache_size_mib: 512`, `num_workers: 4` |
+| `config/config_zarr.yaml` (now `config_zarr_spatial.yaml`) | `chunk_cache_size_mib: 512`, `num_workers: 4` |
 | `submit_gleam_zarr.sh` | `QUEUE`/`NCPUS`/`MEM`/`WALLTIME`/`AFTER` overrides; affinity-based guard (finding 6) |
 | `config/config_zarr_tiny.yaml` | new — tier 1 config against a staged tree |
 | `config/config_zarr_bench.yaml` | new — throwaway store for timing runs |
@@ -661,6 +661,101 @@ concatenation buffer on top of 66 GB already resident) never became resident to
 be counted. Read it with the sys/user ratio beside it: 78% of wall in system
 time for the failed run against 18% for the healthy one.
 
+## Verifying and finalizing the temporal store (2026-09-13)
+
+The store finished at 05:59 on 2026-09-13, 126 of 126 blocks over a chain of
+eight `cpudev` jobs. Verification ran on a login node in two invocations rather
+than one, because the sweep alone takes an hour here and there is no reason to
+pay for it twice:
+
+```bash
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --phases structure,sweep                       # 103 checks, 0 failures, 61 min
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml \
+    --phases index,samples,identities,ranges,metadata \
+    --compare-with config/config_zarr_spatial.yaml # 49 checks, 0 failures, 64 min
+```
+
+**152 checks, 0 failures.** 1.003 TiB compressed across 95,467 chunks, 0.181 of
+logical; 56 boxes (376.4M cells) bit-identical to raw on the right days; both
+component identities closing at all four sampled positions; `time`, `lat` and
+`lon` bit-identical to raw and to the sibling store.
+
+The one non-closing identity is the same upstream property the spatial store
+recorded: `Ep != Ep_aero + Ep_rad` on 76 cells of one tile (0.0012%), where the
+store reproduces raw exactly. Not a conversion defect, and checked rather than
+assumed.
+
+### 14. A temporal draw over this grid is mostly ocean, and silence read as success
+
+`identities` and `ranges` drew their positions uniformly from the 90x180 tile
+grid, of which roughly 58% is ocean. An all-fill position has no identity to
+close and no bound to check, so `check_identities` skipped it — recording no
+check at all — and `check_ranges` passed vacuously on `observed [nan, nan]`.
+With `--identity-days 4` an all-ocean draw is perfectly plausible, and the run
+would have reported success having tested nothing. Nothing was wrong with the
+store; the phases could not have found it if there had been.
+
+Fixed in two halves, because either alone leaves the hole open. The draw is now
+stratified on land (`sample_spots` alternates fully covered and coastal tiles,
+from the same footprint `sample_boxes` already computed), and both phases now
+record whether they found data at all — `identity tested somewhere that holds
+data`, `at least one sampled box holds data`. A draw that finds nothing is now a
+finding rather than a silence. Measured after: 4 of 4 identity positions and 6
+of 6 range boxes hold data, for all 14 variables.
+
+### 15. The variables audit each other's absent tiles
+
+An absent chunk is justified against a handful of sampled raw planes, which
+cannot see a tile holding data only on an unsampled day. Reading all ~9,400
+absent tiles of a variable end to end would settle it and costs about a minute
+each, so it is not affordable; but the variables share a land mask closely
+enough that the interesting holes are few. Ten of the fourteen have tiles that
+*another* variable wrote and they did not — 226 each for `E`, `Ei`, `Ep`,
+`Ep_aero`, `Ew`, `H` and `S`, 149 for `Ep_rad`, 240 for each soil moisture,
+2211 in all — which is the known GLEAM footprint difference, the components
+being finite on some cells where `E` is NaN. `trace_absent_tiles` spends a
+shared budget (`--trace-absent`, 24) on exactly those, reading each from raw
+across all 16802 timesteps. Every one traced was genuinely empty. That is a
+proof for the tiles most likely to hide a loss, at 20 reads against the 131,333
+absent tiles a full audit would mean.
+
+### Finalization, and why there is no tag
+
+`--attrs --apply` added `verification` and corrected two attributes the config
+had guessed ahead of the build: `history` (it said 2026-09-11; the build ran
+2026-09-12/13 as 126 block commits) and `date_created` (a bare date, against the
+sibling's ISO 8601 UTC; the build spans two days, so a bare date is ambiguous).
+
+**Garbage collection found nothing to collect: 0 bytes, 0 chunks, 0 snapshots.**
+That is the region path, and it is worth contrasting with finding 9. The append
+build accumulated 171 fork snapshots because every `to_icechunk` write forks the
+session; the region build's 128 snapshots are exactly 126 blocks plus the
+skeleton plus the initial one, with no surplus at all. A store on this path has
+no routine cleanup to do.
+
+The post-collection gate re-audited every chunk off the manifest with the raw
+comparisons turned down (`--mask-days 1 --smallest 0 --trace-absent 0`), since
+what collection could damage is the manifest and the chunks, not the agreement
+between a chunk and a file that collection never touched: **89 checks, 0
+failures in 12 minutes**, 95467 chunks and 1.003 TiB both unchanged. The full
+depth version of the same phases had already run before collection, and
+collection deleted nothing, so paying an hour to re-read raw would have proven
+only that raw had not changed.
+
+Final state: 30 attributes, 129 snapshots all reachable, 0 unreachable objects.
+`--status` ends with `remaining --tag NAME`, which is the script offering the
+step this store deliberately does not take.
+
+The tier-2 bench store (`bench_temporal`, 123 GB) was deleted after this, as
+`config/config_zarr_bench_temporal.yaml` says to do once tier 2 is recorded.
+
+**No tag.** The convention is `<version>-verified-<YYYYMMDD>` and the spatial
+store carries one, but tags are immutable, and this store is an interim artifact:
+it is to be replaced by one store per variable. Tagging it would permanently name
+something not meant to be cited. The verification is recorded in the store's own
+attributes instead, which a later split can carry forward.
+
 ## Not done, and open questions
 
 - **No `num_workers` sweep.** Finding 5 made it pointless — it would have been
@@ -725,15 +820,15 @@ encoding or chunking logic:
 
 ```bash
 # everything: ~10 minutes on a login node, one core, free
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml
 
 # the metadata-only phases: seconds, and the sweep is the only full-coverage
 # check there is -- run this first after any rebuild
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
     --phases structure,index,sweep
 
 # spend longer on value comparisons
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
+uv run python verify_gleam_zarr.py --config config/config_zarr_spatial.yaml \
     --phases samples --samples 140 --seed 1
 ```
 
@@ -743,8 +838,8 @@ It exits non-zero if any check fails, and writes to
 Finalization is separate, and writes nothing without `--apply`:
 
 ```bash
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
+uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr_spatial.yaml --gc
 ```
 
 Run either without `--apply` first — the output is exactly what the applied run

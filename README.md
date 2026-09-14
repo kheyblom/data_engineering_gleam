@@ -32,7 +32,7 @@ the `zarr` directory next to it:
 ```
 
 The version is spelled `v4.3a` in the config but `v_4_3_a` on disk, and the
-store name carries the same directory spelling. With the config shipped here
+store name carries the same directory spelling. With the configs shipped here
 that resolves to:
 
 ```
@@ -52,7 +52,8 @@ Repository files:
 | [gleam_zarr.py](gleam_zarr.py) | The pipeline: open, merge, chunk, write, resume |
 | [verify_gleam_zarr.py](verify_gleam_zarr.py) | Audits a finished store against the raw files. Read only throughout |
 | [finalize_gleam_zarr.py](finalize_gleam_zarr.py) | Writes attributes, tags a snapshot, collects unreachable objects. The only script here that mutates a finished store |
-| [config/config_zarr.yaml](config/config_zarr.yaml) | The config that drives it |
+| [config/config_zarr_spatial.yaml](config/config_zarr_spatial.yaml) | Config for the map-chunked store |
+| [config/config_zarr_temporal.yaml](config/config_zarr_temporal.yaml) | Config for the time-series-chunked store |
 | [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
 | [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, both write strategies, resume checks |
@@ -60,21 +61,46 @@ Repository files:
 | [draft_zarr.ipynb](draft_zarr.ipynb) | Exploratory scratch work, not part of the pipeline |
 | [TESTING.md](TESTING.md) | How the pipeline was validated and tuned, and what that found |
 
-## Where the finished store lives
+## Where the finished stores live
 
-The v4.3a daily store is built, verified and finalized:
+The same v4.3a daily data is held twice, under the two chunkings, both built
+and verified against the raw files independently:
 
 ```
 /glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr
+/glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.temporal.zarr
 ```
 
-16802 timesteps, 14 variables, 1980-01-01 .. 2025-12-31 on the 1800x3600 grid;
-1.032 TiB compressed, 0.186 of logical. Verified against the source netCDF files
-on 2026-09-10 and tagged **`v4.3a-verified-20260910`**.
+Both hold 16802 timesteps, 14 variables, 1980-01-01 .. 2025-12-31 on the
+1800x3600 grid, with identical coordinates and identical variable attributes —
+`verify_gleam_zarr.py --phases metadata` checks exactly that.
 
-Read it through the tag rather than the branch. A tag in icechunk is immutable,
-so it cannot be moved by a later commit, and `consolidated=False` is required —
-icechunk's manifest does the job zarr's consolidated metadata would:
+| | spatial | temporal |
+| --- | --- | --- |
+| chunk | `1, 1800, 3600`, one global map | `16802, 20, 20`, one 2x2 degree tile through the record |
+| cheap read | a map, a field | a point or small-area time series |
+| compressed | 1.032 TiB, 0.186 of logical | 1.003 TiB, 0.181 of logical |
+| chunks written | 235203 of 235228 | 95467 of 226800 |
+| verified | 2026-09-10, 103 checks | 2026-09-13, 152 checks |
+| tag | `v4.3a-verified-20260910` | none, deliberately |
+
+Neither store's missing chunks are missing data — zarr does not write a chunk
+whose cells are all fill. In the spatial store that is 25 days on which upstream
+`E` is entirely absent. In the temporal store it is the ordinary case: a 20x20
+tile that is ocean is fill for all 16802 timesteps, so more than half the chunk
+grid is legitimately absent. Either way the verifier traces the holes back to
+raw rather than assuming them (TESTING.md, findings 7 and 15).
+
+The temporal store carries **no tag** because tags are immutable and it is an interim
+artifact — it is to be replaced by one store per variable, and a tag would
+permanently name something not meant to be cited. Read it through the `main`
+branch and check its `verification` attribute, which records what was proven
+about it.
+
+The spatial store is tagged, and should be read through the tag rather than the
+branch. A tag in icechunk is immutable, so it cannot be moved by a later commit,
+and `consolidated=False` is required — icechunk's manifest does the job zarr's
+consolidated metadata would:
 
 ```python
 import icechunk
@@ -87,11 +113,12 @@ session = repository.readonly_session(tag='v4.3a-verified-20260910')
 dataset = xr.open_zarr(session.store, consolidated=False)
 ```
 
-The store describes itself: `dataset.attrs` carries the provenance, the coverage
-and grid extents, a `chunking` note on what this layout is and is not good for,
-and `known_data_gaps` recording that `E` is absent on 25 upstream-missing days.
+Both stores describe themselves: `dataset.attrs` carries the provenance, the
+coverage and grid extents, a `chunking` note on what that layout is and is not
+good for, `known_data_gaps` recording that `E` is absent on 25 upstream-missing
+days, and a `verification` line recording what was checked and when.
 
-**It is on scratch, which is purged.** That is a deliberate, accepted risk —
+**They are on scratch, which is purged.** That is a deliberate, accepted risk —
 moving it to `/glade/campaign/univ/umic0112` is a separate piece of work. Until
 then the store should be treated as reproducible rather than archived: rebuilding
 it costs ~57 core-hours, and the raw tree it is built from (~1.7 TiB) sits on the
@@ -118,39 +145,46 @@ previewed before it happens.
 steps remain, so the order does not have to be remembered:
 
 ```bash
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
+uv run python finalize_gleam_zarr.py \
+    --config config/config_zarr_temporal.yaml --status
 ```
 
 ### The procedure
 
+Each store has its own config and the procedure is the same for all of them,
+so the store being finalized is named once and every step follows it:
+
 ```bash
+CONFIG=config/config_zarr_temporal.yaml    # the store being finalized
+
 # 0. pre-flight. Only one writer can hold the icechunk branch, so no build or
 #    resume job may be running against this store
 qstat -u $USER
 
 # 1. baseline, and the state to compare everything against afterwards
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --status
 
 # 2. attributes. Preview, then apply
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs --apply
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --attrs
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --attrs --apply
 
 # 3. tag. Convention is <version>-verified-<YYYYMMDD>, dated so a later
 #    re-verification can add its own tag without ambiguity
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml \
-    --tag v4.3a-verified-20260910 --apply
+uv run python finalize_gleam_zarr.py --config "$CONFIG" \
+    --tag v4.3a-verified-YYYYMMDD --apply
 
 # 4. collect unreachable objects. Read the dry run before applying
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --gc
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --gc --apply
 
 # 5. gates
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml \
-    --phases structure,sweep                       # ~35 s, full chunk coverage
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc --apply
+uv run python verify_gleam_zarr.py --config "$CONFIG" \
+    --phases structure,sweep               # ~35 s spatial, full chunk coverage
+uv run python finalize_gleam_zarr.py --config "$CONFIG" --gc --apply
                                                    # must report all zeros
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
-                                                   # ~9 min, the final word
+uv run python verify_gleam_zarr.py --config "$CONFIG"
+                                                   # ~9 min spatial, ~15 min
+                                                   # temporal: the final word
 ```
 
 All of it runs on a login node for free. Step 4 is the only irreversible one.
@@ -199,7 +233,7 @@ uv sync
 Run the build directly, which is fine for a short test or a small subset:
 
 ```bash
-uv run python gleam_zarr.py --config config/config_zarr.yaml
+uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml
 ```
 
 A full build is far too heavy for a login node, so **submit it as a batch job**
@@ -254,8 +288,10 @@ lands in `logs/` as well. Logs and all data outputs are gitignored.
 
 ## Configuration
 
-Every setting lives in the YAML file passed to `--config`. The one shipped here
-is [config/config_zarr.yaml](config/config_zarr.yaml).
+Every setting lives in the YAML file passed to `--config`. The two production
+ones shipped here are [config/config_zarr_spatial.yaml](config/config_zarr_spatial.yaml)
+and [config/config_zarr_temporal.yaml](config/config_zarr_temporal.yaml); they
+differ only in `suffix`, `chunks`, `write_strategy` and the execution settings.
 
 ### `directories`
 
@@ -270,7 +306,7 @@ is [config/config_zarr.yaml](config/config_zarr.yaml).
 | Key | Meaning |
 | --- | --- |
 | `filename` | Template for the store name. Any scalar at the top level of the config, plus any key under `output_conventions`, can be referenced by name; `{version}` is substituted in its on-disk form (`v_4_3_a`). Referring to a field the config does not define is an error. |
-| `suffix` | A free-form tag fed to the template — `spatial` here — to distinguish stores built from the same source with different chunking or post-processing. |
+| `suffix` | A free-form tag fed to the template — `spatial` or `temporal` here — to distinguish stores built from the same source with different chunking or post-processing. |
 
 ### `attrs`
 

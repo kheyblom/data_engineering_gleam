@@ -78,12 +78,16 @@ attrs:
     GLEAM {version_label} daily netCDF files, 644 files covering 14 variables
     x 46 years, one file per variable-year
   history: >-
-    2026-09-11: written from the GLEAM {version_label} daily netCDF files by
-    gleam_zarr.py (data_engineering_gleam), as a skeleton plus one commit per
-    lat/lon block. Built from the same source files as the sibling
+    2026-09-12/2026-09-13: written from the GLEAM {version_label} daily netCDF
+    files by gleam_zarr.py (data_engineering_gleam @ 0d0b4a9) as a skeleton plus
+    one commit per lat/lon block, 126 blocks over a chain of resumed batch jobs.
+    Built from the same source files as the sibling
     gleam.{version}.{temporal_resolution}.{grid_name}.spatial.zarr, not derived
     from it, so the two are independently verified against raw.
-  date_created: '2026-09-11'
+    2026-09-13: global attributes added by finalize_gleam_zarr.py.
+  # when the last block was committed, in the ISO 8601 UTC form the sibling
+  # store carries; the build spans two days so a bare date would be ambiguous
+  date_created: '2026-09-13T11:59:50Z'
   creator_name: Kyle Heyblom
   creator_email: heyblom@umich.edu
   references: >-
@@ -110,6 +114,16 @@ attrs:
     that also hold valid days, so unlike in the spatial store they leave no
     missing chunks; the chunks that are absent here are the tiles that are NaN
     across the entire record, which is ocean.
-  # 'verification' is deliberately absent until the verifier has actually run
-  # against this store: it is added by finalize_gleam_zarr.py --attrs, which is
-  # gated on that. A store must not carry a claim that has not been earned.
+  # added only once the verifier had actually run against this store, which is
+  # what the claim rests on. A store must not carry a claim it has not earned.
+  verification: >-
+    Verified 2026-09-13 against the source netCDF files by verify_gleam_zarr.py:
+    152 checks, 0 failures across structure, index, samples, sweep (all 95467
+    written chunks), component identities and physical ranges, plus a metadata
+    comparison against the sibling spatial store, which holds identical
+    coordinates, variable attributes and global attributes outside the seven
+    that describe a store's own layout and provenance. Value comparisons are
+    bit-exact, not approximate. Absent chunks are the tiles that hold no data
+    anywhere in the record: every tile holding data on a sampled raw plane was
+    written, and tiles that another variable wrote were read from raw end to end
+    to confirm they really are empty.

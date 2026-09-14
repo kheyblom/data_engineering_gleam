@@ -18,23 +18,26 @@ raw independently — so nothing about one has to be trusted to trust the other.
 
 ```bash
 uv sync                                             # create/refresh .venv from uv.lock
-uv run python gleam_zarr.py --config config/config_zarr.yaml
-uv run python verify_gleam_zarr.py --config config/config_zarr.yaml
+uv run python gleam_zarr.py --config config/config_zarr_temporal.yaml
+uv run python verify_gleam_zarr.py --config config/config_zarr_temporal.yaml
 
 # finalization; writes nothing without --apply, one action per invocation.
 # --status first: it reports which steps a store still needs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --status
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --attrs
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --tag NAME
-uv run python finalize_gleam_zarr.py --config config/config_zarr.yaml --gc
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --status
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --attrs
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --tag NAME
+uv run python finalize_gleam_zarr.py --config config/config_zarr_temporal.yaml --gc
 ```
 
 There is no test suite, linter, or CI configured; the
 notebook [draft_zarr.ipynb](draft_zarr.ipynb) is exploratory scratch work, not
 part of the pipeline. `verify_gleam_zarr.py` audits a *finished* store against
-the raw files — six phases selectable with `--phases`, read only throughout,
-non-zero exit on any failure. It reads the store's chunking and follows it:
-the unit of comparison is a *box* that is one chunk of the store being checked,
+the raw files — seven phases selectable with `--phases`, read only throughout,
+non-zero exit on any failure. Six run by default; `metadata` compares the
+store's attributes and coordinates against a sibling store's and needs
+`--compare-with <config>`, which is how two stores built from the same files
+are held to describing the same data the same way. It reads the store's chunking
+and follows it: the unit of comparison is a *box* that is one chunk of the store,
 a global plane in the spatial store and a 20x20 tile through the whole record in
 the temporal one. Reading the other layout's box is not a style question — one
 global plane out of the temporal store touches every chunk of the variable,
@@ -167,7 +170,11 @@ one lat/lon block of the full record at a time, committing each.
   zarr does not write it. Unlike the spatial store's 25 missing `E` chunks, this
   is the common case rather than the exception, and it is not per-timestep — E's
   all-fill days fall inside chunks that also hold valid days, so they leave no
-  hole at all here.
+  hole at all here. No affordable read confirms 9,000 holes exhaustively, so the
+  verifier checks them in the direction that matters (every tile holding data on
+  a sampled raw plane was written) and then settles the interesting ones
+  outright: a tile some *other* variable wrote is read from raw across the whole
+  record, which proves that hole rather than sampling it.
 
 ### Execution settings
 

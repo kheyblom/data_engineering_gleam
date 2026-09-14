@@ -78,7 +78,7 @@ export OMP_NUM_THREADS=1
 # which matters when the job is sized close to its high water mark
 export MALLOC_TRIM_THRESHOLD_=0
 
-CONFIG="${CONFIG:-config/config_zarr.yaml}"
+CONFIG="${CONFIG:-config/config_zarr_temporal.yaml}"
 
 echo "job      ${PBS_JOBID:-interactive} on $(hostname)"
 echo "started  $(date)"
