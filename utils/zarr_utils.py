@@ -39,6 +39,8 @@ import xarray as xr
 import icechunk
 from icechunk.xarray import to_icechunk
 
+from utils.nomenclature import frequency_long_name
+
 LOG = logging.getLogger(__name__)
 
 # timesteps written per commit when the config does not say otherwise; small
@@ -355,6 +357,11 @@ def describe_variable(dataset, settings):
     reads twice over inside a title that already names the dataset, so it is
     dropped.
 
+    The temporal frequency is written out in full, from the nomenclature key,
+    for the same reason: the canonical token exists to be terse in a filename,
+    and 'GLEAM v4.3a day total evaporation flux' reads as a truncation where
+    'GLEAM v4.3a daily average total evaporation flux' reads as a sentence.
+
     Only the build calls this. Finalization deliberately does not: it would
     otherwise rewrite the title of every finished store whenever this wording
     changed, and a store that has been published should keep the words it was
@@ -385,7 +392,12 @@ def describe_variable(dataset, settings):
     span = f'{str(time.min())[:4]}-{str(time.max())[:4]}'
     lat = dataset['lat'].values
     grid = f'native {abs(float(lat[1] - lat[0])):g} degree global grid'
-    label = f'GLEAM {settings["version"]} {settings["temporal_resolution"]}'
+    # the frequency's long name rather than its canonical token: 'day' is built
+    # for filenames and attributes, and reads as a truncation in a sentence
+    label = (
+        f'GLEAM {settings["version"]} '
+        f'{frequency_long_name(settings["temporal_resolution"])}'
+    )
 
     return {
         'title': (
@@ -393,7 +405,11 @@ def describe_variable(dataset, settings):
             f'{span}, chunked for {chunked_for}'
         ),
         'summary': (
-            f'{long_name} ({name}, {units}) from {label}, on the {grid} over '
+            # the summary opens with it, the title carries it mid-phrase, and
+            # the canonical long names are lowercase, so each gets the case it
+            # needs rather than whichever the key happens to use
+            f'{long_name[0].upper() + long_name[1:]} ({name}, {units}) from '
+            f'{label}, on the {grid} over '
             f'{span}. One variable per store: the other GLEAM variables are in '
             f'sibling stores beside this one, on the same grid and the same '
             f'time axis.'
