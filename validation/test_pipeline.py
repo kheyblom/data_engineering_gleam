@@ -30,8 +30,10 @@ import subprocess
 import sys
 
 import icechunk
+import numpy as np
 import xarray as xr
 
+from utils.nomenclature import canonical_frequency, canonical_variable
 from utils.path_utils import load_config, store_path
 from utils.zarr_utils import BRANCH
 
@@ -400,6 +402,143 @@ def case_published_guard(results):
     repository.delete_tag(tag)
 
 
+def migrated_path(config, original):
+    """Where a store ends up once migrate_nomenclature.py has run on it.
+
+    Args:
+        config (str): Path to the config naming the layout.
+        original (str): The variable as GLEAM publishes it, e.g. 'E'.
+
+    Returns:
+        str: The migrated store's path.
+    """
+    settings = load_config(os.path.join(ROOT, config))
+    settings['variable'] = canonical_variable(original)
+    settings['temporal_resolution'] = canonical_frequency(
+        settings['temporal_resolution']
+    )
+    return store_path(settings)
+
+
+def case_migration(results):
+    """migrate_nomenclature.py renames a built store without touching its data.
+
+    Runs last, because it renames every fixture store and every earlier case
+    addresses them by their pre-migration names.
+
+    The check that matters is the one on the values: the migration claims to be
+    metadata only, and the way to test that claim is to read the data back
+    afterwards and compare it to what was there before, rather than to trust the
+    script's own fingerprint guard. A tag is planted first so the case also
+    covers a *published* store, which is what every production store is, and so
+    the rollback path is exercised rather than assumed.
+
+    Args:
+        results (Results): Where to record outcomes.
+    """
+    tag = 'fixture-pre-migration'
+    settings = load_config(os.path.join(ROOT, SPATIAL))
+    settings['variable'] = 'E'
+    repository = icechunk.Repository.open(
+        icechunk.local_filesystem_storage(store_path(settings))
+    )
+    if tag not in list(repository.list_tags()):
+        repository.create_tag(tag, next(iter(repository.ancestry(branch=BRANCH))).id)
+
+    before = {
+        (config, variable): open_store(config, variable)[variable].values
+        for config in (SPATIAL, TEMPORAL)
+        for variable in VARIABLES
+    }
+
+    done, ok = run('migrate_nomenclature.py', '--config', SPATIAL)
+    results.check(
+        'a dry run reports every step and writes nothing',
+        ok
+        and 'rename-array then attrs then rename-store' in output(done)
+        and os.path.exists(store_path(settings)),
+        'store still at its original path',
+    )
+
+    applied = []
+    for config in (SPATIAL, TEMPORAL):
+        done, ok = run('migrate_nomenclature.py', '--config', config, '--apply')
+        applied.append(ok and 'unchanged' in output(done))
+    results.check(
+        'both layouts migrate, and the script reports the store unchanged',
+        all(applied),
+        f'{sum(applied)} of 2 layouts',
+    )
+
+    renamed = [
+        os.path.isdir(migrated_path(config, variable))
+        and not os.path.isdir(store_path({**load_config(os.path.join(ROOT, config)),
+                                          'variable': variable}))
+        for config in (SPATIAL, TEMPORAL)
+        for variable in VARIABLES
+    ]
+    results.check(
+        'every store is renamed to its canonical name and frequency',
+        all(renamed),
+        f'{sum(renamed)} of {len(renamed)} stores, '
+        f'e.g. {os.path.basename(migrated_path(SPATIAL, "E"))}',
+    )
+
+    identical, attributed = [], []
+    for (config, variable), values in before.items():
+        canonical = canonical_variable(variable)
+        repo = icechunk.Repository.open(
+            icechunk.local_filesystem_storage(migrated_path(config, variable))
+        )
+        dataset = xr.open_zarr(
+            repo.readonly_session(branch=BRANCH).store, consolidated=False
+        )
+        identical.append(
+            list(dataset.data_vars) == [canonical]
+            and np.array_equal(dataset[canonical].values, values, equal_nan=True)
+        )
+        attrs = dataset[canonical].attrs
+        attributed.append(
+            attrs['units'] == 'mm d-1'
+            and attrs['original_units'] == 'mm.day-1'
+            and attrs['original_variable_name'] == variable
+            and attrs['standard_name'] == canonical
+        )
+    results.check(
+        'every value survives the migration bit-identically',
+        all(identical),
+        f'{sum(identical)} of {len(identical)} stores unchanged',
+    )
+    results.check(
+        'the canonical units are written and the originals kept beside them',
+        all(attributed),
+        f'{sum(attributed)} of {len(attributed)} stores',
+    )
+
+    done, ok = run('migrate_nomenclature.py', '--config', SPATIAL, '--apply')
+    results.check(
+        're-running a migrated store does nothing',
+        ok and output(done).count('already migrated') == len(VARIABLES),
+        'idempotent',
+    )
+
+    # the tag is the undo: it still names the store as it was, under its old
+    # name, from the renamed directory
+    repository = icechunk.Repository.open(
+        icechunk.local_filesystem_storage(migrated_path(SPATIAL, 'E'))
+    )
+    rolled_back = xr.open_zarr(
+        repository.readonly_session(tag=tag).store, consolidated=False
+    )
+    results.check(
+        'the pre-migration tag still resolves, and still reads as it did',
+        list(rolled_back.data_vars) == ['E']
+        and rolled_back['E'].attrs['units'] == 'mm.day-1',
+        'the migration is reversible',
+    )
+    repository.delete_tag(tag)
+
+
 def parse_args():
     """Parse the command line.
 
@@ -440,6 +579,7 @@ def main():
     case_resume(results)
     case_time_axis_guard(results, tmp)
     case_published_guard(results)
+    case_migration(results)
 
     if not args.keep:
         for config in (SPATIAL, TEMPORAL):
