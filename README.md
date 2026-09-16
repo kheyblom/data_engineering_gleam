@@ -61,7 +61,6 @@ Repository files:
 | [config/config_zarr_spatial.yaml](config/config_zarr_spatial.yaml) | Config for the 14 map-chunked stores |
 | [config/config_zarr_temporal.yaml](config/config_zarr_temporal.yaml) | Config for the 14 time-series-chunked stores |
 | [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
-| [migrate_nomenclature.py](migrate_nomenclature.py) | **Temporary.** Brings a store built before the style guide onto it, without a rebuild. Delete once the 28 are done |
 | [nomenclature-key_gleam.md](nomenclature-key_gleam.md) | GLEAM's names and units mapped onto `nomenclature_data.md`. Machine read |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
 | [utils/nomenclature.py](utils/nomenclature.py) | Reads the nomenclature key; the one place names and units come from |
@@ -90,7 +89,18 @@ grid, and every one is verified against the raw netCDF files and tagged
 **`v4.3a-verified-20260915`**. Each also still carries
 `v4.3a-verified-20260914`, which names the snapshot from before the
 nomenclature migration — the same data under GLEAM's own names, kept as the
-rollback point. The two layouts of a variable carry identical
+rollback point. Nothing has been garbage collected, so it still works:
+
+```python
+# roll one store back to its pre-migration names. The rename was metadata only,
+# so this is too -- no chunk is rewritten
+repository.reset_branch('main', repository.lookup_tag('v4.3a-verified-20260914'))
+```
+
+followed by renaming the directory back to
+`gleam.v_4_3_a.daily.native_0p1x0p1.<GLEAM name>.zarr`. Running
+`finalize_gleam_zarr.py --gc --apply` would collect the objects that tag holds
+and end this, which is why it has not been run. The two layouts of a variable carry identical
 coordinates and identical variable attributes — `verify_gleam_zarr.py --phases
 metadata` checks exactly that, per variable.
 

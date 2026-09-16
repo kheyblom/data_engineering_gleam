@@ -30,9 +30,7 @@ import subprocess
 import sys
 
 import icechunk
-import numpy as np
 import xarray as xr
-import zarr
 
 from utils.nomenclature import canonical_variable, variables
 from utils.path_utils import load_config, store_path
@@ -482,170 +480,6 @@ def store_path_for(config, original):
     return store_path(settings)
 
 
-def rewind_to_legacy(config, original):
-    """Put a freshly built store back into the shape the 2026-09 stores are in.
-
-    The build is compliant now, so there is nothing left on disk for
-    migrate_nomenclature.py to migrate -- and the script still has 28 real
-    stores to run against. This manufactures one: the array goes back to GLEAM's
-    name, its attributes go back to the strings GLEAM published, and the
-    directory goes back to the old spelling.
-
-    title and summary are replaced with a sentinel rather than the old wording.
-    The point is not to reproduce the old text, it is to prove the migration
-    *regenerates* them -- if they were left correct, the check that they come
-    out right would pass without the migration having done anything.
-
-    Args:
-        config (str): Path to the config naming the layout.
-        original (str): The variable as GLEAM publishes it, e.g. 'E'.
-
-    Returns:
-        str: The path the store now sits at, under its legacy name.
-    """
-    canonical = canonical_variable(original)
-    path = store_path_for(config, original)
-    repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
-
-    session = repository.rearrange_session(BRANCH)
-    session.move(f'/{canonical}', f'/{original}')
-    session.commit('rewind: back to the GLEAM variable name')
-
-    session = repository.writable_session(BRANCH)
-    group = zarr.open_group(session.store, mode='r+')
-    attrs = dict(group[original].attrs)
-    group[original].update_attributes({
-        'standard_name': attrs['original_standard_name'],
-        'long_name': attrs['original_long_name'],
-        'units': attrs['original_units'],
-    })
-    # update_attributes merges, so the canonical-era keys have to go explicitly
-    for key in ('original_variable_name', 'original_standard_name',
-                'original_long_name', 'original_units', 'unit_conversion'):
-        del group[original].attrs[key]
-    group.update_attributes(
-        dict(group.attrs) | {'title': 'LEGACY', 'summary': 'LEGACY'}
-    )
-    session.commit('rewind: back to the GLEAM variable attributes')
-
-    legacy = os.path.join(
-        os.path.dirname(path),
-        os.path.basename(path).replace('.day.', '.daily.').replace(
-            f'.{canonical}.zarr', f'.{original}.zarr'
-        ),
-    )
-    os.rename(path, legacy)
-    return legacy
-
-
-def case_migration(results):
-    """migrate_nomenclature.py reproduces a compliant build, without a rebuild.
-
-    The claim the migration makes is not just "it renames things" -- it is that
-    a store brought onto the guide is indistinguishable from one built onto it.
-    So the check is an equivalence: build compliant, record what that produced,
-    rewind the store to the legacy shape, migrate it, and require the result to
-    match what the build made. Anything the two word differently shows up here.
-
-    Runs last, because rewinding renames every fixture store.
-
-    Args:
-        results (Results): Where to record outcomes.
-    """
-    built = {}
-    for config in (SPATIAL, TEMPORAL):
-        for original in VARIABLES:
-            canonical = canonical_variable(original)
-            dataset = open_store(config, original)
-            built[(config, original)] = {
-                'attrs': dict(dataset[canonical].attrs),
-                'title': dataset.attrs['title'],
-                'summary': dataset.attrs['summary'],
-                'values': dataset[canonical].values,
-            }
-            rewind_to_legacy(config, original)
-
-    results.check(
-        'a rewound store is found under its legacy name',
-        not os.path.exists(store_path_for(SPATIAL, 'E'))
-        and os.path.exists(
-            store_path_for(SPATIAL, 'E').replace('.day.', '.daily.').replace(
-                '.evaporation.zarr', '.E.zarr'
-            )
-        ),
-        'legacy fixture manufactured',
-    )
-
-    done, ok = run('migrate_nomenclature.py', '--config', SPATIAL)
-    results.check(
-        'a dry run reports every step and writes nothing',
-        ok
-        and 'rename-array then attrs then rename-store' in output(done)
-        and not os.path.exists(store_path_for(SPATIAL, 'E')),
-        'store still at its legacy path',
-    )
-
-    applied = []
-    for config in (SPATIAL, TEMPORAL):
-        done, ok = run('migrate_nomenclature.py', '--config', config, '--apply')
-        applied.append(ok and 'unchanged' in output(done))
-    results.check(
-        'both layouts migrate, and the script reports the store unchanged',
-        all(applied),
-        f'{sum(applied)} of 2 layouts',
-    )
-
-    same_attrs, same_prose, same_values = [], [], []
-    for (config, original), before in built.items():
-        canonical = canonical_variable(original)
-        dataset = open_store(config, original)
-        same_attrs.append(
-            list(dataset.data_vars) == [canonical]
-            and dict(dataset[canonical].attrs) == before['attrs']
-        )
-        same_prose.append(
-            dataset.attrs['title'] == before['title']
-            and dataset.attrs['summary'] == before['summary']
-        )
-        same_values.append(
-            np.array_equal(
-                dataset[canonical].values, before['values'], equal_nan=True
-            )
-        )
-    results.check(
-        'a migrated store has the variable attributes a built one has',
-        all(same_attrs),
-        f'{sum(same_attrs)} of {len(same_attrs)} stores identical',
-    )
-    results.check(
-        'a migrated store has the title and summary a built one has',
-        all(same_prose),
-        f'{sum(same_prose)} of {len(same_prose)} regenerated from the sentinel',
-    )
-    results.check(
-        'every value survives the migration bit-identically',
-        all(same_values),
-        f'{sum(same_values)} of {len(same_values)} stores unchanged',
-    )
-
-    done, ok = run('migrate_nomenclature.py', '--config', SPATIAL, '--apply')
-    results.check(
-        're-running a migrated store does nothing',
-        ok and output(done).count('already migrated') == len(VARIABLES),
-        'idempotent',
-    )
-
-    done, ok = run(
-        'verify_gleam_zarr.py', '--config', SPATIAL, '--variable', 'evaporation',
-        '--phases', 'structure,sweep',
-    )
-    results.check(
-        'the verifier accepts a migrated store, addressed canonically',
-        ok and 'store verified' in output(done),
-        'exit 0',
-    )
-
-
 def parse_args():
     """Parse the command line.
 
@@ -687,7 +521,6 @@ def main():
     case_resume(results)
     case_time_axis_guard(results, tmp)
     case_published_guard(results)
-    case_migration(results)
 
     if not args.keep:
         for config in (SPATIAL, TEMPORAL):

@@ -17,8 +17,10 @@ layout with `--variable` picking the store within it.
 **Migrated 2026-09-15.** All 28 now carry `evaporation`, `mm d-1` and `.day.`,
 re-verified against raw (0 failures) and tagged `v4.3a-verified-20260915`; the
 older `v4.3a-verified-20260914` tag still names the pre-migration snapshot and
-is the rollback point. `migrate_nomenclature.py` did that and has no work left
--- it is temporary and can be deleted.
+is the rollback point, and nothing has been garbage collected, so it still
+works -- `reset_branch` to that tag plus renaming the directory back. The
+temporary `migrate_nomenclature.py` that did the migration has been deleted;
+it is in git history if it is ever needed again.
 
 The two layouts are not derived from each other: each was built from raw and
 verified against raw independently, so nothing about one has to be trusted to
@@ -142,11 +144,11 @@ Consequences worth knowing before editing:
   rather than corrected afterwards. It is a relabelling of a dask graph; no data
   moves.
 - `canonical_variable_attrs` is shared by the build and
-  `migrate_nomenclature.py` deliberately. If each wrote its own version, a
-  migrated store and a fresh one would eventually describe the same data
-  differently, which is the one outcome this is all meant to prevent. It is
+  the (now deleted) `migrate_nomenclature.py` deliberately, so a migrated store
+  and a fresh one could not describe the same data differently. It is
   idempotent: applied twice it reads the `original_*` attributes back rather
-  than re-deriving them from values already replaced.
+  than re-deriving them from values already replaced, which is what let the same
+  function serve both.
 - The region path takes its block variable from `sorted(dataset.data_vars)`, not
   from the build's argument, because the block name goes into the commit message
   that resume parses back.
@@ -332,9 +334,9 @@ way, so worst-case memory is `file_cache_maxsize` x `chunk_cache_size_mib`.
   'daily average', because the canonical token `day` exists to be terse in a
   filename and reads as a truncation in a sentence. The long name is lowercase
   in the key, so the summary capitalises it and the title does not; each gets
-  the case its position needs. Only the build and `migrate_nomenclature.py`
-  call it — finalization deliberately does not, or a wording change would
-  rewrite the title of every published store.
+  the case its position needs. Only the build calls it — finalization
+  deliberately does not, or a wording change would rewrite the title of every
+  published store.
 - `variable_attrs` in a config carries attributes true of one variable rather
   than of the layout, merged over the shared `attrs`. Only `E` has any: its
   upstream data gap. A store must not carry a note about data it does not hold.
@@ -362,9 +364,9 @@ does. Module docstrings carry the context needed to read the file.
 ### Layout
 
 The three entry points — `gleam_zarr.py`, `verify_gleam_zarr.py` and
-`finalize_gleam_zarr.py` — sit at the repo root, as does the temporary
-`migrate_nomenclature.py` and the nomenclature key it reads. `validation/`
-holds the developer tests, `stage_fixture.py` and `test_pipeline.py`.
+`finalize_gleam_zarr.py` — sit at the repo root, as does the nomenclature key
+they read. `validation/` holds the developer tests, `stage_fixture.py` and
+`test_pipeline.py`.
 
 **Settled 2026-09-14.** The trigger set on 2026-09-10 was "a second validation
 script", and `test_pipeline.py` is it. `pyproject.toml` now carries a
