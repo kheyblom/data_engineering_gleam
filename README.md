@@ -76,21 +76,21 @@ The v4.3a daily data is held as **28 stores: one per variable, in each of two
 chunkings**. The layout is the directory and the variable is the name:
 
 ```
-<zarr>/spatial/gleam.v_4_3_a.daily.native_0p1x0p1.<variable>.zarr
-<zarr>/temporal/gleam.v_4_3_a.daily.native_0p1x0p1.<variable>.zarr
+<zarr>/spatial/gleam.v_4_3_a.day.native_0p1x0p1.<variable>.zarr
+<zarr>/temporal/gleam.v_4_3_a.day.native_0p1x0p1.<variable>.zarr
 ```
 
-> **These 28 predate the nomenclature alignment.** They still carry GLEAM's own
-> names — the array is `E`, the units are `mm.day-1`, the store is spelled
-> `.daily.` — while the pipeline now builds to the style guide, under
-> `.day.` and `evaporation`. [migrate_nomenclature.py](migrate_nomenclature.py)
-> brings them across without a rebuild; until it has been run, this section
-> describes what is on disk and the Configuration section describes what a build
-> would now produce.
+The variable is its canonical name from `nomenclature_data.md` —
+`evaporation`, `soil_moisture_root_zone` — and so is the array inside. The name
+GLEAM publishes is kept on the variable as `original_variable_name`, with
+`original_units`, `original_long_name` and `original_standard_name` beside it.
 
 Every store holds 16802 timesteps, 1980-01-01 .. 2025-12-31 on the 1800x3600
 grid, and every one is verified against the raw netCDF files and tagged
-**`v4.3a-verified-20260914`**. The two layouts of a variable carry identical
+**`v4.3a-verified-20260915`**. Each also still carries
+`v4.3a-verified-20260914`, which names the snapshot from before the
+nomenclature migration — the same data under GLEAM's own names, kept as the
+rollback point. The two layouts of a variable carry identical
 coordinates and identical variable attributes — `verify_gleam_zarr.py --phases
 metadata` checks exactly that, per variable.
 
@@ -100,7 +100,7 @@ metadata` checks exactly that, per variable.
 | cheap read | a map, a field | a point or small-area time series |
 | per variable | ~75 GiB, 16802 chunks (16777 for `E`) | ~72 GiB, ~6800 of 16200 tiles |
 | all 14 | 1.1 T | 1.1 T |
-| verified | 2026-09-14, 26-33 checks per store | 2026-09-14, 28-34 checks per store |
+| verified | 2026-09-15, 26-33 checks per store | 2026-09-15, 28-34 checks per store |
 
 A missing chunk is not missing data — zarr does not write a chunk whose cells
 are all fill. In the spatial stores that is the 25 days on which upstream `E` is
@@ -119,9 +119,9 @@ import icechunk
 import xarray as xr
 
 path = ('/glade/derecho/scratch/kheyblom/data/gleam/v_4_3_a/zarr/'
-        'temporal/gleam.v_4_3_a.daily.native_0p1x0p1.E.zarr')
+        'temporal/gleam.v_4_3_a.day.native_0p1x0p1.evaporation.zarr')
 repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
-session = repository.readonly_session(tag='v4.3a-verified-20260914')
+session = repository.readonly_session(tag='v4.3a-verified-20260915')
 dataset = xr.open_zarr(session.store, consolidated=False)
 ```
 

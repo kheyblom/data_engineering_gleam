@@ -90,13 +90,20 @@ attrs:
   # added only once the verifier had actually run against these stores. A store
   # must not carry a claim it has not earned.
   verification: >-
-    Verified 2026-09-14 against the source netCDF files by verify_gleam_zarr.py:
-    structure, index, sampled value comparisons, a sweep of every chunk in this
-    store, physical ranges, and a metadata comparison against the {variable}
-    store in the other layout. 0 failures; value comparisons are bit-exact, not
-    approximate. Every absent chunk was traced to a raw plane that is entirely fill, so a chunk count below the timestep count is confirmed rather than assumed. The GLEAM component identities -- E against its six
-    components, Ep against its two -- are checked from the store holding the
-    total, which reads the component stores alongside it.
+    Verified 2026-09-15 against the source netCDF files by verify_gleam_zarr.py,
+    on this store under its present name: structure, index, sampled value
+    comparisons, a sweep of every chunk in this store, physical ranges, and a
+    metadata comparison against the {variable} store in the other layout.
+    26-33 checks per store across the family, 0 failures; value comparisons are
+    bit-exact, not approximate. Every absent chunk was traced to a raw plane
+    that is entirely fill, so a chunk count below the timestep count is
+    confirmed rather than assumed. The GLEAM component identities -- E against
+    its six components, Ep against its two -- are checked from the store
+    holding the total, which reads the component stores alongside it. This run
+    supersedes the 2026-09-14 one, which verified the same data under GLEAM's
+    original variable names; the nomenclature migration between them was
+    metadata only, and the tag v4.3a-verified-20260914 still names the snapshot
+    it covered.
 
 # Attributes that belong to one variable rather than to the layout, keyed by
 # variable and merged over the shared ones above. Only E has any: its upstream

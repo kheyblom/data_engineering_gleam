@@ -14,12 +14,11 @@ The deliverable is **28 stores: one per variable, under each of two chunkings**
 the directory, the variable is the filename, and one config addresses a whole
 layout with `--variable` picking the store within it.
 
-**The 28 stores on disk still predate this.** They carry `E`, `mm.day-1` and
-`.daily.`; the pipeline now builds `evaporation`, `mm d-1` and `.day.`.
-`migrate_nomenclature.py` brings them across without a rebuild -- it is
-temporary and should be deleted once they are done. Until it has run, the
-README's "Where the finished stores live" describes disk and its Configuration
-section describes what a build would now produce.
+**Migrated 2026-09-15.** All 28 now carry `evaporation`, `mm d-1` and `.day.`,
+re-verified against raw (0 failures) and tagged `v4.3a-verified-20260915`; the
+older `v4.3a-verified-20260914` tag still names the pre-migration snapshot and
+is the rollback point. `migrate_nomenclature.py` did that and has no work left
+-- it is temporary and can be deleted.
 
 The two layouts are not derived from each other: each was built from raw and
 verified against raw independently, so nothing about one has to be trusted to
