@@ -39,6 +39,12 @@ import xarray as xr
 import icechunk
 from icechunk.xarray import to_icechunk
 
+from utils.nomenclature import (
+    canonical_variable,
+    canonical_variable_attrs,
+    frequency_long_name,
+)
+
 LOG = logging.getLogger(__name__)
 
 # timesteps written per commit when the config does not say otherwise; small
@@ -345,6 +351,47 @@ def derive_attrs(dataset):
     }
 
 
+def apply_nomenclature(dataset, original):
+    """Rename a variable to its canonical name and restandardize its attributes.
+
+    The style guide requires the name, the units and the long name to come from
+    ``nomenclature_data.md``, and requires the change from the original to be
+    recorded in the metadata. Both happen here, on the lazy dataset, before
+    anything is written -- so the store is built correct rather than corrected
+    afterwards.
+
+    Renaming the variable does not touch the data: it is a relabelling of an
+    unevaluated dask graph, and the values, dtype and chunking are untouched.
+    The coordinates are deliberately not renamed; ``nomenclature_data.md`` has
+    no rows for them.
+
+    Args:
+        dataset (xarray.Dataset): The variable's dataset, as opened from the
+            netCDF files and so still named as GLEAM publishes it.
+        original (str): The variable as GLEAM publishes it, e.g. 'E'.
+
+    Returns:
+        xarray.Dataset: The renamed dataset, carrying the canonical attributes.
+
+    Raises:
+        KeyError: If the variable has no row in the nomenclature key.
+        ValueError: If the dataset does not hold exactly that one variable.
+    """
+    if list(dataset.data_vars) != [original]:
+        raise ValueError(
+            f'expected exactly [{original!r}], found {list(dataset.data_vars)}'
+        )
+    canonical = canonical_variable(original)
+    attrs = canonical_variable_attrs(dict(dataset[original].attrs), original)
+    dataset = dataset.rename({original: canonical})
+    dataset[canonical].attrs = attrs
+    LOG.info(
+        f'{original} -> {canonical}, units {attrs["original_units"]!r} -> '
+        f'{attrs["units"]!r}'
+    )
+    return dataset
+
+
 def describe_variable(dataset, settings):
     """Title and summary for a store holding exactly one variable.
 
@@ -354,6 +401,11 @@ def describe_variable(dataset, settings):
     component'. Every GLEAM ``long_name`` ends '... from GLEAM 4.3a', which
     reads twice over inside a title that already names the dataset, so it is
     dropped.
+
+    The temporal frequency is written out in full, from the nomenclature key,
+    for the same reason: the canonical token exists to be terse in a filename,
+    and 'GLEAM v4.3a day total evaporation flux' reads as a truncation where
+    'GLEAM v4.3a daily average total evaporation flux' reads as a sentence.
 
     Only the build calls this. Finalization deliberately does not: it would
     otherwise rewrite the title of every finished store whenever this wording
@@ -385,7 +437,12 @@ def describe_variable(dataset, settings):
     span = f'{str(time.min())[:4]}-{str(time.max())[:4]}'
     lat = dataset['lat'].values
     grid = f'native {abs(float(lat[1] - lat[0])):g} degree global grid'
-    label = f'GLEAM {settings["version"]} {settings["temporal_resolution"]}'
+    # the frequency's long name rather than its canonical token: 'day' is built
+    # for filenames and attributes, and reads as a truncation in a sentence
+    label = (
+        f'GLEAM {settings["version"]} '
+        f'{frequency_long_name(settings["temporal_resolution"])}'
+    )
 
     return {
         'title': (
@@ -393,7 +450,11 @@ def describe_variable(dataset, settings):
             f'{span}, chunked for {chunked_for}'
         ),
         'summary': (
-            f'{long_name} ({name}, {units}) from {label}, on the {grid} over '
+            # the summary opens with it, the title carries it mid-phrase, and
+            # the canonical long names are lowercase, so each gets the case it
+            # needs rather than whichever the key happens to use
+            f'{long_name[0].upper() + long_name[1:]} ({name}, {units}) from '
+            f'{label}, on the {grid} over '
             f'{span}. One variable per store: the other GLEAM variables are in '
             f'sibling stores beside this one, on the same grid and the same '
             f'time axis.'

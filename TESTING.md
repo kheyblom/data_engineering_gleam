@@ -11,6 +11,13 @@ ones on 2026-09-13 and deleted on 2026-09-14. Figures in the early sections are
 correct for what existed when they were written, not for what is on disk now.
 The later sections carry the current numbers.
 
+**It also predates the nomenclature alignment.** Every variable name and unit
+below is GLEAM's -- `E`, `Ep_aero`, `mm.day-1` -- because that is what the
+stores held throughout this testing, and it is still what the 28 on disk hold.
+The pipeline now builds to the style guide (`evaporation`, `mm d-1`, `.day.`);
+see the nomenclature section of CLAUDE.md. Nothing below is invalidated by that
+-- no value changed -- but the names are the old ones.
+
 The pipeline had never been run to completion — `logs/` was empty and no store
 existed. The goal was to prove it worked end to end, and to choose
 `timesteps_per_commit`, `num_workers` and `file_cache_maxsize` from

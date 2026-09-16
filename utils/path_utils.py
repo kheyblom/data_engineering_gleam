@@ -16,6 +16,13 @@ import glob
 
 import yaml # type: ignore
 
+from utils.nomenclature import (
+    as_original,
+    canonical_frequency,
+    canonical_variable,
+    key_path,
+)
+
 # 'v4.3a' -> ('4', '3', 'a'), the pieces of the on disk version directory name
 VERSION_RE = re.compile(r'^v(?P<major>\d+)\.(?P<minor>\d+)(?P<letter>[a-z])$')
 
@@ -121,6 +128,19 @@ def template_fields(settings):
     form so rendered text carries the same spelling as the input tree, and
     ``version_label`` holds it as the config writes it.
 
+    Three fields come in pairs, because a store's *name* and its *inputs* are
+    spelled differently and both have to be reachable from a template:
+
+    - ``version`` / ``version_label`` -- 'v_4_3_a' for a name, 'v4.3a' for prose.
+    - ``temporal_frequency`` / ``temporal_resolution`` -- the canonical 'day' for
+      a name, GLEAM's 'daily' for the raw directory the files are read from.
+    - ``variable`` / ``original_variable`` -- the canonical 'evaporation' for a
+      name, GLEAM's 'E' for anything describing the source files.
+
+    The scripts set ``variable`` to the GLEAM name, since that is what the raw
+    tree and the config's variable list are keyed on; it is translated here, at
+    the one point where a name is rendered, rather than at every call site.
+
     Args:
         settings (dict): The loaded configuration.
 
@@ -137,6 +157,12 @@ def template_fields(settings):
     # it is actually written, so both are offered rather than one converted
     fields['version_label'] = settings['version']
     fields['version'] = format_version(settings['version'])
+    fields['temporal_frequency'] = canonical_frequency(settings['temporal_resolution'])
+    # absent when a run addresses the whole family rather than one store, in
+    # which case no template that needs it is being rendered
+    if settings.get('variable') is not None:
+        fields['original_variable'] = settings['variable']
+        fields['variable'] = canonical_variable(settings['variable'])
     return fields
 
 
@@ -151,7 +177,7 @@ def format_filename(settings):
         settings (dict): The loaded configuration.
 
     Returns:
-        str: e.g. 'gleam_v_4_3_a_daily_native_0p1x0p1_spatial.zarr'.
+        str: e.g. 'spatial/gleam.v_4_3_a.day.native_0p1x0p1.evaporation.zarr'.
 
     Raises:
         ValueError: If the template refers to a field the config does not define.
@@ -225,7 +251,7 @@ def store_path(settings):
         settings (dict): The loaded configuration.
 
     Returns:
-        str: e.g. '<download>/v_4_3_a/zarr/gleam_v_4_3_a_daily_..._spatial.zarr'.
+        str: e.g. '<download>/v_4_3_a/zarr/spatial/gleam.v_4_3_a.day...zarr'.
     """
     return os.path.join(version_root(settings), ZARR_DIRNAME, format_filename(settings))
 
@@ -308,3 +334,37 @@ def variable_files(settings, variable):
     if not files:
         raise FileNotFoundError(f'no netCDF files matching {pattern}')
     return files
+
+
+def resolve_variable(name, family=None):
+    """Normalise a ``--variable`` argument to the name the raw tree uses.
+
+    Either spelling is accepted, because which one a person has depends on where
+    they were looking. The raw tree and a config's variable list are keyed on
+    GLEAM's ``E``; a directory listing of the finished stores shows
+    ``evaporation``. Asking someone to translate between the two to address a
+    store they can see is a footgun with no upside, so both work and everything
+    downstream gets the GLEAM name.
+
+    Args:
+        name (str): The argument as given, in either spelling.
+        family (list, optional): The variables available, to check membership
+            against. Omitted where the raw tree may not be present -- a store
+            that has been relocated away from its inputs is still finalizable.
+
+    Returns:
+        str: The GLEAM name, e.g. 'E'.
+
+    Raises:
+        ValueError: If the name is neither spelling, or is not in the family.
+    """
+    try:
+        original = as_original(name)
+    except KeyError:
+        raise ValueError(
+            f'{name!r} is neither a GLEAM variable name nor a canonical name '
+            f'in {key_path()}'
+        ) from None
+    if family is not None and original not in family:
+        raise ValueError(f'{original!r} is not in the family {family}')
+    return original

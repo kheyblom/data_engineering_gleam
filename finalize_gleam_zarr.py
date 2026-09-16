@@ -50,7 +50,12 @@ import xarray as xr
 import zarr
 
 from utils.log_utils import setup_logging
-from utils.path_utils import format_attrs, load_config, store_path
+from utils.path_utils import (
+    format_attrs,
+    load_config,
+    resolve_variable,
+    store_path,
+)
 from utils.zarr_utils import BRANCH, derive_attrs, open_existing_repository
 
 LOG = logging.getLogger(__name__)
@@ -345,8 +350,10 @@ def main(settings, args):
         int: 0 if the action succeeded, 1 otherwise.
     """
     if args.variable:
-        # renders the family's filename template for this one store
-        settings['variable'] = args.variable
+        # renders the family's filename template for this one store. No family
+        # check: a store that has been moved away from its raw inputs is still
+        # finalizable, and resolve_variables would need the raw tree
+        settings['variable'] = resolve_variable(args.variable)
     path = store_path(settings)
     LOG.info(f'finalizing {path}')
     if not args.apply and not args.status:

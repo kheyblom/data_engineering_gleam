@@ -32,6 +32,7 @@ import sys
 import icechunk
 import xarray as xr
 
+from utils.nomenclature import canonical_variable, variables
 from utils.path_utils import load_config, store_path
 from utils.zarr_utils import BRANCH
 
@@ -249,19 +250,83 @@ def case_attributes(results):
     title = dataset.attrs.get('title', '')
     results.check(
         'title is derived from the long name, not the variable code',
-        'potential evaporation from the aerodynamic component' in title
+        'potential evaporation flux from the aerodynamic component' in title
         and 'chunked for time series' in title,
         title[:78],
     )
     results.check(
-        'summary names the variable and its units',
-        '(Ep_aero, mm.day-1)' in dataset.attrs.get('summary', ''),
+        'title names the frequency in full, not as its canonical token',
+        'daily average' in title and ' day ' not in title,
+        title[:44],
+    )
+    results.check(
+        'summary names the variable and its units, canonically',
+        '(potential_evaporation_aerodynamic, mm d-1)'
+        in dataset.attrs.get('summary', ''),
     )
     results.check(
         'variable_attrs reaches only the variable it names',
         'known_data_gaps' in open_store(TEMPORAL, 'E').attrs
         and 'known_data_gaps' not in dataset.attrs,
         'E has one, Ep_aero does not',
+    )
+
+
+def case_nomenclature(results):
+    """A build lands on the style guide without any migration step.
+
+    This is the half of the guide that a config cannot express: the array's name
+    and its units come from the nomenclature key, and the strings GLEAM
+    published have to survive beside them.
+
+    Args:
+        results (Results): Where to record outcomes.
+    """
+    named, attributed, sourced = [], [], []
+    for config in (SPATIAL, TEMPORAL):
+        for original in VARIABLES:
+            canonical = canonical_variable(original)
+            dataset = open_store(config, original)
+            named.append(
+                list(dataset.data_vars) == [canonical]
+                and canonical in os.path.basename(store_path_for(config, original))
+            )
+            attrs = dataset[canonical].attrs
+            attributed.append(
+                attrs['units'] == variables()[original].units
+                and attrs['long_name'] == variables()[original].long_name
+                and attrs['standard_name'] == canonical
+                and attrs['original_variable_name'] == original
+                and attrs['original_units'] == 'mm.day-1'
+                and attrs['original_long_name'].endswith('from GLEAM 4.3a')
+            )
+            # {original_variable} has to reach a template, or the provenance
+            # attributes would name the store rather than the files it came from
+            sourced.append(f'holding {original}' in dataset.attrs.get('source', ''))
+    results.check(
+        'the store and its array carry the canonical name',
+        all(named),
+        f'{sum(named)} of {len(named)} stores, '
+        f'e.g. {os.path.basename(store_path_for(SPATIAL, "Ep_aero"))}',
+    )
+    results.check(
+        'canonical units and long name are written, originals kept beside them',
+        all(attributed),
+        f'{sum(attributed)} of {len(attributed)} stores',
+    )
+    results.check(
+        'source names the GLEAM variable, not the canonical one',
+        all(sourced),
+        f'{sum(sourced)} of {len(sourced)} stores',
+    )
+
+    frequency = open_store(SPATIAL, 'E').attrs
+    results.check(
+        'the frequency rename is recorded in the metadata',
+        frequency.get('temporal_frequency') == 'day'
+        and frequency.get('original_temporal_frequency') == 'daily',
+        f'{frequency.get("original_temporal_frequency")} -> '
+        f'{frequency.get("temporal_frequency")}',
     )
 
 
@@ -400,6 +465,21 @@ def case_published_guard(results):
     repository.delete_tag(tag)
 
 
+def store_path_for(config, original):
+    """Where a layout's store for one variable lives.
+
+    Args:
+        config (str): Path to the config naming the layout.
+        original (str): The variable as GLEAM publishes it, e.g. 'E'.
+
+    Returns:
+        str: The store's path, under its canonical name.
+    """
+    settings = load_config(os.path.join(ROOT, config))
+    settings['variable'] = original
+    return store_path(settings)
+
+
 def parse_args():
     """Parse the command line.
 
@@ -436,6 +516,7 @@ def main():
     case_verifies(results)
     case_cross_store_checks(results)
     case_attributes(results)
+    case_nomenclature(results)
     case_rebuild(results)
     case_resume(results)
     case_time_axis_guard(results, tmp)
