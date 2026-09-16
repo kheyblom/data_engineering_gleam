@@ -46,6 +46,7 @@ from utils.path_utils import (
     format_attrs,
     load_config,
     raw_dir,
+    resolve_variable,
     resolve_variables,
     store_path,
     variable_files,
@@ -55,6 +56,7 @@ from utils.log_utils import (
 )
 from utils.zarr_utils import (
     DEFAULT_WRITE_STRATEGY,
+    apply_nomenclature,
     block_read_chunks,
     build_encoding,
     check_resume,
@@ -114,6 +116,11 @@ def build_dataset(settings, variable, reference):
 
     LOG.info(f'opening {len(files)} files for {variable}')
     dataset = open_variable(files, read_chunks)
+
+    # the store carries the canonical name and units from here on; the raw tree,
+    # the config's variable list and this function's own argument stay on
+    # GLEAM's spelling, because that is what names the files on disk
+    dataset = apply_nomenclature(dataset, variable)
 
     # -1 in the config means the whole dimension, which is only known now that
     # the files are open
@@ -184,7 +191,7 @@ def write_append(repository, dataset, chunks, settings):
     return write_dataset(repository, dataset, encoding, batch_size, start=n_written)
 
 
-def write_region(repository, dataset, chunks, settings, variable):
+def write_region(repository, dataset, chunks, settings):
     """Write the store as a skeleton, then fill it block by block.
 
     Args:
@@ -192,7 +199,6 @@ def write_region(repository, dataset, chunks, settings, variable):
         dataset (xarray.Dataset): The lazy dataset to write.
         chunks (dict): Resolved chunk sizes.
         settings (dict): The loaded configuration.
-        variable (str): The variable the store holds.
 
     Returns:
         int: The number of blocks written.
@@ -201,7 +207,11 @@ def write_region(repository, dataset, chunks, settings, variable):
         ValueError: If a partially filled store cannot be resumed into.
     """
     block_shape = resolve_block_shape(settings, chunks, dataset.sizes)
-    blocks = iter_blocks([variable], dataset.sizes, block_shape)
+    # the name the *store* uses, which is the canonical one, not the GLEAM name
+    # this build was asked for. A block is written into the store and its
+    # coordinates go into the commit message that resume reads back, so taking
+    # the name from the dataset is what keeps those two from disagreeing
+    blocks = iter_blocks(sorted(dataset.data_vars), dataset.sizes, block_shape)
     LOG.info(f'blocking as {block_shape}: {len(blocks)} blocks')
 
     # build_encoding also clears the stale netCDF encoding off every variable,
@@ -300,7 +310,7 @@ def build_store(settings, variable, reference, force=False):
         written = write_append(repository, dataset, chunks, settings)
         LOG.info(f'wrote {written} batches to {path}')
     else:
-        written = write_region(repository, dataset, chunks, settings, variable)
+        written = write_region(repository, dataset, chunks, settings)
         LOG.info(f'wrote {written} blocks to {path}')
     return path
 
@@ -321,8 +331,10 @@ def main(settings, variable=None, force=False):
     # is needed whichever is built: its first member is the reference every
     # variable's time axis is checked against
     family = resolve_variables(settings)
-    if variable is not None and variable not in family:
-        raise ValueError(f'{variable!r} is not in the family {family}')
+    if variable is not None:
+        # --variable takes either spelling and yields GLEAM's, which is what
+        # names the raw directory this build reads from
+        variable = resolve_variable(variable, family)
     reference = family[0]
     building = [variable] if variable else family
 

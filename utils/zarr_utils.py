@@ -39,7 +39,11 @@ import xarray as xr
 import icechunk
 from icechunk.xarray import to_icechunk
 
-from utils.nomenclature import frequency_long_name
+from utils.nomenclature import (
+    canonical_variable,
+    canonical_variable_attrs,
+    frequency_long_name,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -345,6 +349,47 @@ def derive_attrs(dataset):
         'geospatial_lat_resolution': round(lat_step, 4),
         'geospatial_lon_resolution': round(lon_step, 4),
     }
+
+
+def apply_nomenclature(dataset, original):
+    """Rename a variable to its canonical name and restandardize its attributes.
+
+    The style guide requires the name, the units and the long name to come from
+    ``nomenclature_data.md``, and requires the change from the original to be
+    recorded in the metadata. Both happen here, on the lazy dataset, before
+    anything is written -- so the store is built correct rather than corrected
+    afterwards.
+
+    Renaming the variable does not touch the data: it is a relabelling of an
+    unevaluated dask graph, and the values, dtype and chunking are untouched.
+    The coordinates are deliberately not renamed; ``nomenclature_data.md`` has
+    no rows for them.
+
+    Args:
+        dataset (xarray.Dataset): The variable's dataset, as opened from the
+            netCDF files and so still named as GLEAM publishes it.
+        original (str): The variable as GLEAM publishes it, e.g. 'E'.
+
+    Returns:
+        xarray.Dataset: The renamed dataset, carrying the canonical attributes.
+
+    Raises:
+        KeyError: If the variable has no row in the nomenclature key.
+        ValueError: If the dataset does not hold exactly that one variable.
+    """
+    if list(dataset.data_vars) != [original]:
+        raise ValueError(
+            f'expected exactly [{original!r}], found {list(dataset.data_vars)}'
+        )
+    canonical = canonical_variable(original)
+    attrs = canonical_variable_attrs(dict(dataset[original].attrs), original)
+    dataset = dataset.rename({original: canonical})
+    dataset[canonical].attrs = attrs
+    LOG.info(
+        f'{original} -> {canonical}, units {attrs["original_units"]!r} -> '
+        f'{attrs["units"]!r}'
+    )
+    return dataset
 
 
 def describe_variable(dataset, settings):

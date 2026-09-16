@@ -289,6 +289,81 @@ def frequency_long_name(name, path=None):
     return _frequency(name, path).long_name
 
 
+def as_original(name, path=None):
+    """The GLEAM name, given either the GLEAM name or the canonical one.
+
+    The two spellings are both legitimate handles on the same variable, and
+    which one a person has depends on where they are looking: the raw tree and
+    the config's variable list use GLEAM's ``E``, while a directory listing of
+    the finished stores shows ``evaporation``. Command line arguments accept
+    either and normalise here, so ``--variable`` never has to be looked up.
+
+    Args:
+        name (str): Either spelling.
+        path (str, optional): The key file. Defaults to the repo's own.
+
+    Returns:
+        str: The GLEAM name.
+
+    Raises:
+        KeyError: If the name is neither.
+    """
+    key = variables(path)
+    if name in key:
+        return name
+    return original_variable(name, path)
+
+
+def canonical_variable_attrs(current, original, path=None):
+    """The attributes a data variable should carry under the style guide.
+
+    One function for two callers that must not disagree: the build applies it to
+    what it read out of the netCDF, and ``migrate_nomenclature.py`` applies it to
+    what an already-built store holds. If each wrote its own version, a migrated
+    store and a freshly built one would eventually describe the same data
+    differently, which is the one outcome the whole exercise is meant to prevent.
+
+    The ``original_*`` values come from the attributes handed in rather than from
+    the key, so they record what GLEAM really published instead of what a table
+    claims it did. On a second pass the canonical values are already in place, so
+    the upstream strings are read back out of the ``original_*`` attributes
+    written the first time rather than re-derived from values that have since
+    been replaced -- which is what makes applying this twice a no-op.
+
+    Args:
+        current (dict): The variable's attributes as they stand.
+        original (str): The variable as GLEAM publishes it, e.g. 'E'.
+        path (str, optional): The key file. Defaults to the repo's own.
+
+    Returns:
+        dict: The full attribute set for the variable.
+    """
+    entry = variables(path)[original]
+    migrated = 'original_variable_name' in current
+    originals = {
+        'original_variable_name': current.get('original_variable_name', original),
+        'original_standard_name': current.get(
+            'original_standard_name' if migrated else 'standard_name', ''
+        ),
+        'original_long_name': current.get(
+            'original_long_name' if migrated else 'long_name', ''
+        ),
+        'original_units': current.get('original_units' if migrated else 'units', ''),
+    }
+    return {
+        **current,
+        'standard_name': entry.canonical,
+        'long_name': entry.long_name,
+        'units': entry.units,
+        **originals,
+        'unit_conversion': (
+            f'{entry.unit_conversion} -- {originals["original_units"]!r} and '
+            f'{entry.units!r} are the same unit under a different spelling; '
+            f'no value was changed'
+        ),
+    }
+
+
 def original_variable(canonical, path=None):
     """The GLEAM name behind a canonical name.
 

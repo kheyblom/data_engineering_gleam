@@ -31,19 +31,25 @@ the `zarr` directory next to it:
 <directories.download>/<version>/zarr/<output_conventions.filename>
 ```
 
-The version is spelled `v4.3a` in the config but `v_4_3_a` on disk, and the
-store name carries the same directory spelling. With the configs shipped here
-that resolves to:
+Two spellings differ between the input tree and the output name, and both
+translations happen in exactly one place. The version is written `v4.3a` in the
+config and `v_4_3_a` on disk (`format_version`); the temporal frequency and the
+variable are GLEAM's `daily` and `E` in the raw tree and the canonical `day` and
+`evaporation` in the store name (`nomenclature-key_gleam.md`, read by
+`utils/nomenclature.py`). With the configs shipped here that resolves to:
 
 ```
-/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/raw/daily/<variable>/*.nc
-/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.spatial.zarr
-/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/gleam.v_4_3_a.daily.native_0p1x0p1.temporal.zarr
+/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/raw/daily/E/*.nc
+/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/spatial/gleam.v_4_3_a.day.native_0p1x0p1.evaporation.zarr
+/glade/derecho/scratch/$USER/data/gleam/v_4_3_a/zarr/temporal/gleam.v_4_3_a.day.native_0p1x0p1.evaporation.zarr
 ```
 
 The `suffix` field is the only difference between the two directories, and the
 only difference between the configs that build them is `chunks`,
 `write_strategy` and the block size.
+
+`--variable` accepts either spelling, so a store can be addressed by the name in
+its own filename or by the GLEAM name in the raw tree.
 
 Repository files:
 
@@ -55,7 +61,10 @@ Repository files:
 | [config/config_zarr_spatial.yaml](config/config_zarr_spatial.yaml) | Config for the 14 map-chunked stores |
 | [config/config_zarr_temporal.yaml](config/config_zarr_temporal.yaml) | Config for the 14 time-series-chunked stores |
 | [submit_gleam_zarr.sh](submit_gleam_zarr.sh) | Derecho batch job wrapper |
+| [migrate_nomenclature.py](migrate_nomenclature.py) | **Temporary.** Brings a store built before the style guide onto it, without a rebuild. Delete once the 28 are done |
+| [nomenclature-key_gleam.md](nomenclature-key_gleam.md) | GLEAM's names and units mapped onto `nomenclature_data.md`. Machine read |
 | [utils/path_utils.py](utils/path_utils.py) | Config loading and path construction |
+| [utils/nomenclature.py](utils/nomenclature.py) | Reads the nomenclature key; the one place names and units come from |
 | [utils/zarr_utils.py](utils/zarr_utils.py) | Chunking, encoding, both write strategies, resume checks |
 | [utils/log_utils.py](utils/log_utils.py) | Logging to stdout and to the log file |
 | [draft_zarr.ipynb](draft_zarr.ipynb) | Exploratory scratch work, not part of the pipeline |
@@ -70,6 +79,14 @@ chunkings**. The layout is the directory and the variable is the name:
 <zarr>/spatial/gleam.v_4_3_a.daily.native_0p1x0p1.<variable>.zarr
 <zarr>/temporal/gleam.v_4_3_a.daily.native_0p1x0p1.<variable>.zarr
 ```
+
+> **These 28 predate the nomenclature alignment.** They still carry GLEAM's own
+> names — the array is `E`, the units are `mm.day-1`, the store is spelled
+> `.daily.` — while the pipeline now builds to the style guide, under
+> `.day.` and `evaporation`. [migrate_nomenclature.py](migrate_nomenclature.py)
+> brings them across without a rebuild; until it has been run, this section
+> describes what is on disk and the Configuration section describes what a build
+> would now produce.
 
 Every store holds 16802 timesteps, 1980-01-01 .. 2025-12-31 on the 1800x3600
 grid, and every one is verified against the raw netCDF files and tagged
@@ -331,9 +348,23 @@ differ only in `suffix`, `chunks`, `write_strategy` and the execution settings.
 
 | Key | Meaning |
 | --- | --- |
-| `filename` | Template for the store name. Any scalar at the top level of the config, plus any key under `output_conventions`, can be referenced by name; `{version}` is substituted in its on-disk form (`v_4_3_a`). Referring to a field the config does not define is an error. |
-| `suffix` | A free-form tag fed to the template — `spatial` or `temporal` here. It names the directory the layout's 14 stores sit in, so the same variable under two chunkings differs only by that one path segment. |
+| `filename` | Template for the store name. Any scalar at the top level of the config, plus any key under `output_conventions`, can be referenced by name. Referring to a field the config does not define is an error. |
+| `suffix` | A free-form tag fed to the template — `spatial` or `temporal` here. It names the directory the layout's 14 stores sit in, so the same variable under two chunkings differs only by that one path segment. The style guide's filename convention has no field for the chunking, so the directory is what distinguishes them and the two basenames are identical. |
 | `variable` | Not written in the config: the scripts set it from `--variable`, and the filename template renders it. One config therefore addresses a whole layout, one store at a time. |
+
+Three fields come in pairs, because a store's **name** and its **inputs** are
+spelled differently and a template has to be able to reach either:
+
+| Naming | Source | |
+| --- | --- | --- |
+| `{version}` → `v_4_3_a` | `{version_label}` → `v4.3a` | the on-disk spelling against the one the config writes |
+| `{temporal_frequency}` → `day` | `{temporal_resolution}` → `daily` | the canonical frequency from `nomenclature_data.md` against GLEAM's, which names the raw directory |
+| `{variable}` → `evaporation` | `{original_variable}` → `E` | the canonical variable name against GLEAM's, which names the raw directory and the files in it |
+
+The translation happens once, in `template_fields`, so the scripts carry GLEAM's
+name everywhere and only a rendered string ever carries the canonical one. An
+attribute describing the *source files* wants `{original_variable}` — they really
+do hold a variable called `E`.
 
 ### `attrs`
 
@@ -376,7 +407,7 @@ variable_attrs:
 | `log_file` | Name of the log file written inside `directories.logs`. Opened in append mode, so a resumed run adds to the existing log rather than truncating it. |
 | `version` | GLEAM version, written as `v<major>.<minor><letter>` (e.g. `v4.3a`). Translated to the on-disk spelling `v_4_3_a` in exactly one place, `format_version`. A version that does not parse is an error. |
 | `variables` | Either a list of variable names or the shorthand `all`. `all` expands to every variable directory actually present under `raw/<temporal_resolution>/`; an explicit list is kept in the order given, and a listed variable with no directory on disk is an error rather than a silent skip. |
-| `temporal_resolution` | Which resolution to build — `daily` here. Selects the subdirectory under `raw/`, and only the one configured is built. |
+| `temporal_resolution` | Which resolution to build — `daily` here, GLEAM's own spelling. Selects the subdirectory under `raw/`, and only the one configured is built. It is *not* what the store is named: `nomenclature-key_gleam.md` maps it to the canonical `day`, which is what `{temporal_frequency}` renders. |
 | `grid_name` | Label for the grid the data is on (`native_0p1x0p1`). Used in the store name; it describes the data rather than reprojecting it, so changing it renames the output, it does not regrid. |
 | `chunks` | Chunk size per dimension for the zarr store, in the dask convention where `-1` means the whole dimension. This is the main knob on both the shape of the output and what a run costs. `time: 1, lat: -1, lon: -1` gives one whole global map per chunk, 24.7 MiB on the 1800x3600 grid — the `spatial` layout, built for reading maps and the worst possible one for a point time series, which touches all 16802 chunks of a variable. `time: -1, lat: 20, lon: 20` gives one 2x2 degree tile through the whole record, 25.6 MiB — the `temporal` layout, where that time series is a single chunk and a global map is the worst case instead. |
 | `write_strategy` | `append` (the default) or `region`; how the store is filled. It is not a free choice: it has to match the chunking, and `resolve_write_strategy` raises rather than letting a mismatch through, because both mismatches fail quietly. An `append` build of a store whose time chunk spans the record collapses into a single uninterruptible commit that a walltime kill loses entirely; a `region` build of a shallowly chunked one reads the whole record into memory to write chunks one timestep deep. |

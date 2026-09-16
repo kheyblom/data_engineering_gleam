@@ -5,7 +5,7 @@ output_conventions:
   # one store per variable: the layout is the directory, the variable is the
   # name. {variable} renders from the top-level key the scripts set from
   # --variable, so one config addresses all 14 stores of a layout
-  filename: '{suffix}/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr'
+  filename: '{suffix}/gleam.{version}.{temporal_frequency}.{grid_name}.{variable}.zarr'
   suffix: spatial
 log_file: gleam_zarr.log
 version: v4.3a
@@ -36,15 +36,38 @@ attrs:
   # ACDD rather than CF, deliberately: see cf_compliance
   Conventions: ACDD-1.3
   cf_compliance: >-
-    Not CF compliant. Each variable's standard_name and units are carried
-    through unaltered from the upstream GLEAM netCDF files, so the
-    standard_name values are descriptive strings rather than CF standard names
-    ('Actual evaporation', not 'water_evaporation_flux') and the units are
-    spelled 'mm.day-1' and 'm3.m-3', which udunits does not parse. Correcting
-    them would mean diverging from upstream, so they are left as published.
+    Not CF compliant. Variable names, units and long names follow the internal
+    data engineering nomenclature key rather than CF, so standard_name carries
+    the canonical name ('evaporation', not the CF 'water_evaporation_flux') and
+    is not a CF standard name. The canonical unit spellings do parse under
+    udunits for the fluxes and the soil moisture ('mm d-1', 'W m-2', 'm3 m-3'),
+    unlike the 'mm.day-1' and 'm3.m-3' GLEAM publishes; the dimensionless
+    variable is written 'unitless' rather than udunits' '1'. What GLEAM
+    published is kept on the variable as original_standard_name,
+    original_long_name and original_units.
+  # the style guide requires the change from the original nomenclature to be
+  # recorded in the metadata, not only in the key. The per-variable half of that
+  # lives on the variable itself; this is the half that is true of every store.
+  nomenclature: >-
+    Variable names, units and the temporal frequency follow
+    nomenclature_data.md, the authoritative internal key. This store holds
+    GLEAM's {original_variable} under its canonical name, on the canonical
+    temporal frequency '{temporal_frequency}' rather than GLEAM's
+    '{temporal_resolution}'. No value was converted: the canonical units are the
+    published units under a different spelling. The variable carries the
+    original strings as original_* attributes, and the full mapping is
+    nomenclature-key_gleam.md in the data_engineering_gleam repository.
+  temporal_frequency: '{temporal_frequency}'
+  original_temporal_frequency: '{temporal_resolution}'
+  # the guide asks that float64 be flagged so reducing precision can be weighed
+  dtype_note: >-
+    The data variable is float32, the dtype GLEAM publishes; nothing in this
+    pipeline reduces or widens it. The lat and lon coordinates are float64, also
+    as published upstream. They are index coordinates of 1800 and 3600 values,
+    so the storage at stake is negligible.
   source: >-
-    GLEAM {version_label} daily netCDF files: 46 files holding {variable}, one
-    per year, 1980-2025
+    GLEAM {version_label} {temporal_resolution} netCDF files: 46 files holding
+    {original_variable}, one per year, 1980-2025
   date_created: '2026-09-10T10:24:11Z'
   creator_name: Kyle Heyblom
   creator_email: heyblom@umich.edu
@@ -56,7 +79,7 @@ attrs:
     map per chunk, 24.7 MiB. Built for reading maps and fields. A point time
     series is the worst case for this layout, touching all 16802 chunks of this
     store; for time series read the sibling
-    temporal/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr
+    temporal/gleam.{version}.{temporal_frequency}.{grid_name}.{variable}.zarr
     instead, which holds the same data chunked (16802, 20, 20).
   # title, summary, history, related_store and known_data_gaps are deliberately
   # absent. Each store carries its own, written per variable when the

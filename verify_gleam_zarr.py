@@ -81,10 +81,12 @@ import zarr
 from utils.log_utils import setup_logging
 from utils.path_utils import (
     load_config,
+    resolve_variable,
     resolve_variables,
     store_path,
     variable_files,
 )
+from utils.nomenclature import canonical_variable
 from utils.zarr_utils import (
     BRANCH,
     commit_batch_size,
@@ -98,13 +100,15 @@ LOG = logging.getLogger(__name__)
 # the sentinel the raw files carry; build_encoding replaces it with NaN
 RAW_FILL = np.float32(-999.0)
 
-# plausible bounds keyed on the units attribute, so a new variable inherits
-# them rather than needing a table entry of its own
+# plausible bounds keyed on the units attribute, so a new variable inherits them
+# rather than needing a table entry of its own. Keyed on the *canonical* units:
+# nomenclature_data.md defines a closed set of spellings, and a store that has
+# been through this pipeline carries one of them.
 BOUNDS_BY_UNITS = {
-    'mm.day-1': (-50.0, 200.0),     # evaporation fluxes, either sign
-    'W.m-2': (-1000.0, 1000.0),     # sensible heat flux
-    'm3.m-3': (0.0, 1.0),           # volumetric soil moisture
-    '-': (0.0, 1.0),                # evaporative stress, dimensionless
+    'mm d-1': (-50.0, 200.0),       # evaporation fluxes, either sign
+    'W m-2': (-1000.0, 1000.0),     # sensible heat flux
+    'm3 m-3': (0.0, 1.0),           # volumetric soil moisture
+    'unitless': (0.0, 1.0),         # evaporative stress, dimensionless
 }
 
 # GLEAM's actual evaporation is the sum of its components, with condensation
@@ -301,6 +305,27 @@ def open_store(settings):
     repository = icechunk.Repository.open(icechunk.local_filesystem_storage(path))
     session = repository.readonly_session(branch=BRANCH)
     return repository, session, xr.open_zarr(session.store, consolidated=False)
+
+
+def store_array(dataset, name):
+    """The store's array for a variable, named in either spelling.
+
+    The verifier works in two vocabularies at once and has to, because it exists
+    to compare one against the other: the raw netCDF tree is laid out under
+    GLEAM's ``E`` and the store names its array ``evaporation``, and a single
+    loop routinely touches both. Translating at each site invites the one site
+    that gets missed, so every store access goes through here instead.
+
+    Args:
+        dataset (xarray.Dataset): The store.
+        name (str): Either the GLEAM name or the canonical one.
+
+    Returns:
+        xarray.DataArray: The variable's array.
+    """
+    if name in dataset.data_vars:
+        return dataset[name]
+    return dataset[canonical_variable(name)]
 
 
 def sibling_session(settings, variable):
@@ -633,8 +658,8 @@ def check_structure(report, session, dataset, variables, settings):
 
     report.check(
         'store holds exactly the configured variables',
-        set(dataset.data_vars) == set(variables),
-        f'{len(dataset.data_vars)} variables',
+        set(dataset.data_vars) == {canonical_variable(v) for v in variables},
+        f'{len(dataset.data_vars)} variables: {sorted(dataset.data_vars)}',
     )
     report.note(f'dimensions {dict(dataset.sizes)}, {dataset.nbytes / 1024**4:.2f} TiB logical')
 
@@ -688,7 +713,7 @@ def check_structure(report, session, dataset, variables, settings):
             root[coordinate].chunks == (dataset.sizes[coordinate],),
             str(root[coordinate].chunks),
         )
-    report.note(f'codecs {root[variables[0]].metadata.codecs}')
+    report.note(f'codecs {root[canonical_variable(variables[0])].metadata.codecs}')
     report.note(f'global attributes {sorted(dataset.attrs)}')
 
     # the chunking attribute is the one piece of prose a reader is expected to
@@ -956,7 +981,11 @@ def check_samples(report, dataset, index, variables, args, chunks, layout, setti
     n_failed = 0
     for name, t0, t1, lat, lon in boxes:
         raw = read_raw_box(index, name, t0, t1, lat, lon)
-        stored = dataset[name].isel(time=slice(t0, t1), lat=lat, lon=lon).values
+        stored = (
+            store_array(dataset, name)
+            .isel(time=slice(t0, t1), lat=lat, lon=lon)
+            .values
+        )
         mask_ok, values_ok, _ = compare_box(stored, raw)
 
         # the store's own time values must be the ones the raw files carry at
@@ -1008,7 +1037,11 @@ async def sibling_written_grids(settings, variables, grid):
         if session is None:
             continue
         written = np.zeros(grid, dtype=bool)
-        async for coordinate in session.chunk_coordinates(f'/{name}'):
+        # the sibling store names its array canonically, though the family this
+        # loops over is keyed on GLEAM's spelling
+        async for coordinate in session.chunk_coordinates(
+            f'/{canonical_variable(name)}'
+        ):
             written[coordinate[1], coordinate[2]] = True
         grids[name] = written
     return grids
@@ -1119,7 +1152,10 @@ async def check_sweep(
     # the chunk's own logical size, so the floor means the same thing on a test
     # window as it does on the production grid
     chunk_bytes = (
-        chunks['time'] * chunks['lat'] * chunks['lon'] * dataset[variables[0]].dtype.itemsize
+        chunks['time']
+        * chunks['lat']
+        * chunks['lon']
+        * store_array(dataset, variables[0]).dtype.itemsize
     )
     floor = int(DEGENERATE_FRACTION[layout] * chunk_bytes)
     total_bytes = 0
@@ -1135,7 +1171,10 @@ async def check_sweep(
         )
 
     for name in variables:
-        coordinates = [c async for c in session.chunk_coordinates(f'/{name}')]
+        # the loop is keyed on GLEAM's name, because the raw side of the sweep
+        # is, but every path into the store is the canonical one
+        array_path = canonical_variable(name)
+        coordinates = [c async for c in session.chunk_coordinates(f'/{array_path}')]
         report.check(
             f'{name:9s} every chunk inside the {n_time_chunks}x{grid[0]}x{grid[1]} '
             f'grid, none duplicated',
@@ -1158,7 +1197,7 @@ async def check_sweep(
         chunk_sizes = np.asarray(
             await asyncio.gather(
                 *(
-                    session.store.getsize(f'{name}/c/{t}/{i}/{j}')
+                    session.store.getsize(f'{array_path}/c/{t}/{i}/{j}')
                     for t, i, j in coordinates
                 )
             )
@@ -1236,7 +1275,7 @@ async def check_sweep(
         for k in order:
             lat, lon = tile_box(coordinates[k][1:], chunks, sizes)
             raw = read_raw_box(index, name, 0, n_time, lat, lon)
-            stored = dataset[name].isel(
+            stored = store_array(dataset, name).isel(
                 time=slice(0, n_time), lat=lat, lon=lon
             ).values
             mask_ok, values_ok, valid_cells = compare_box(stored, raw)
@@ -1317,18 +1356,24 @@ def identity_sources(report, dataset, settings, total_name, components):
         total_name (str): Left-hand side of the identity.
         components (tuple): Right-hand side.
 
+    The identity table is written in GLEAM's names, because that is what the
+    physics is published in, while the stores name their arrays canonically.
+    Rather than make the caller translate, this returns the *arrays*: one
+    lookup, already resolved, keyed by the name the identity is written in.
+
     Returns:
-        dict: Variable name -> the dataset holding it, or None if this store
-            should not run this identity or a store is missing.
+        dict: GLEAM variable name -> the DataArray holding it, or None if this
+            store should not run this identity or a store is missing.
     """
     variable = settings.get('variable')
     if variable is not None and total_name != variable:
         return None
 
-    sources, missing = {}, []
+    sources, missing, foreign = {}, [], 0
     for name in (total_name, *components):
-        if name in dataset.data_vars:
-            sources[name] = dataset
+        canonical = canonical_variable(name)
+        if canonical in dataset.data_vars:
+            sources[name] = dataset[canonical]
             continue
         if variable is None:
             # an all-variable store simply does not hold this identity
@@ -1337,12 +1382,17 @@ def identity_sources(report, dataset, settings, total_name, components):
         if session is None:
             missing.append(name)
         else:
-            sources[name] = xr.open_zarr(session.store, consolidated=False)
+            sources[name] = xr.open_zarr(session.store, consolidated=False)[canonical]
+            foreign += 1
     if missing:
         report.note(
             f'{total_name} identity not checked: no store found for {missing}'
         )
         return None
+    # what makes this a cross-store read is the components, not the total, which
+    # is always this store's own
+    if foreign:
+        report.note(f'{total_name} identity read across {len(sources)} stores')
     return sources
 
 
@@ -1375,14 +1425,10 @@ def check_identities(report, dataset, index, variables, args, chunks, layout, se
         sources = identity_sources(report, dataset, settings, total_name, components)
         if sources is None:
             continue
-        # the total is always this store's own; what makes it a cross-store read
-        # is the components, so that is what decides whether to say so
-        if any(source is not dataset for source in sources.values()):
-            report.note(f'{total_name} identity read across {len(sources)} stores')
         tested = 0
         for t0, t1, lat, lon in spots:
             select = dict(time=slice(t0, t1), lat=lat, lon=lon)
-            total = sources[total_name][total_name].isel(**select).values
+            total = sources[total_name].isel(**select).values
             if not np.isfinite(total).any():
                 # nothing but fill here, so there is no identity to close. The
                 # count below is what keeps a draw that lands entirely on ocean
@@ -1394,7 +1440,7 @@ def check_identities(report, dataset, index, variables, args, chunks, layout, se
                 continue
             tested += 1
             summed = sum(
-                sources[name][name].isel(**select).values for name in components
+                sources[name].isel(**select).values for name in components
             )
             residual = np.abs(total - summed)
             valid = np.isfinite(total) & np.isfinite(summed)
@@ -1470,11 +1516,15 @@ def check_ranges(report, dataset, index, variables, args, chunks, layout):
     )
 
     for name in variables:
-        units = dataset[name].attrs.get('units')
+        units = store_array(dataset, name).attrs.get('units')
         bounds = BOUNDS_BY_UNITS.get(units)
         counts, cells, lows, highs = [], [], [], []
         for t0, t1, lat, lon in spots:
-            values = dataset[name].isel(time=slice(t0, t1), lat=lat, lon=lon).values
+            values = (
+                store_array(dataset, name)
+                .isel(time=slice(t0, t1), lat=lat, lon=lon)
+                .values
+            )
             finite = np.isfinite(values)
             counts.append(int(finite.sum()))
             cells.append(int(values.size))
@@ -1491,7 +1541,17 @@ def check_ranges(report, dataset, index, variables, args, chunks, layout):
             f'{sum(1 for c in counts if c)} of {len(spots)} boxes hold data',
         )
         if bounds is None:
-            report.note(f'{name} has units {units!r} with no bounds to check')
+            # a failure rather than a note. An unrecognised unit string means
+            # either a variable that never went through the nomenclature key or
+            # a table that has fallen behind it, and in both cases this phase
+            # silently stops checking the thing it exists to check -- while
+            # still exiting 0 and still reporting 'store verified'. A gate that
+            # goes green when it has stopped working is worse than a red one.
+            report.check(
+                f'{name:9s} units {units!r} are in the bounds table',
+                False,
+                f'known: {sorted(BOUNDS_BY_UNITS)}',
+            )
             continue
         if not lows:
             continue
@@ -1519,7 +1579,7 @@ def check_ranges(report, dataset, index, variables, args, chunks, layout):
         if len(set(counts)) > 1:
             t0 = spots[int(np.argmin(counts))][0]
             plane_raw = read_raw_plane(index, name, t0)
-            stored = dataset[name].isel(time=t0).values
+            stored = store_array(dataset, name).isel(time=t0).values
             mask_ok, _, n_valid = compare_box(stored, plane_raw)
             report.check(
                 f'{name:9s} moving valid footprint follows raw exactly',
@@ -1693,10 +1753,10 @@ def main(settings, args):
     family = resolve_variables(settings)
     variables = family
     if args.variable:
-        if args.variable not in family:
-            raise ValueError(f'{args.variable!r} is not in the family {family}')
-        settings['variable'] = args.variable
-        variables = [args.variable]
+        # either spelling is accepted; everything downstream uses GLEAM's, which
+        # is what the raw tree and the identity table are keyed on
+        settings['variable'] = resolve_variable(args.variable, family)
+        variables = [settings['variable']]
     repository, session, dataset = open_store(settings)
 
     # the chunking decides what a cheap read is, so it is resolved once here and
@@ -1754,7 +1814,7 @@ def main(settings, args):
         other = load_config(args.compare_with)
         if args.variable:
             # the sibling layout holds the same variable in its own store
-            other['variable'] = args.variable
+            other['variable'] = settings['variable']
         check_metadata(report, dataset, other)
 
     LOG.info(f'{report.n_checks} checks, {len(report.failures)} failures')

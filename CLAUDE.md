@@ -14,6 +14,13 @@ The deliverable is **28 stores: one per variable, under each of two chunkings**
 the directory, the variable is the filename, and one config addresses a whole
 layout with `--variable` picking the store within it.
 
+**The 28 stores on disk still predate this.** They carry `E`, `mm.day-1` and
+`.daily.`; the pipeline now builds `evaporation`, `mm d-1` and `.day.`.
+`migrate_nomenclature.py` brings them across without a rebuild -- it is
+temporary and should be deleted once they are done. Until it has run, the
+README's "Where the finished stores live" describes disk and its Configuration
+section describes what a build would now produce.
+
 The two layouts are not derived from each other: each was built from raw and
 verified against raw independently, so nothing about one has to be trusted to
 trust the other. The per-variable stores were split from two all-variable stores
@@ -105,6 +112,46 @@ The version is spelled `v4.3a` in the config but `v_4_3_a` on disk;
 name carries the same directory spelling. `variables: all` expands against the
 directories actually present under `raw/<temporal_resolution>/`, and a
 config-listed variable with no directory is an error rather than a skip.
+
+### Nomenclature: two vocabularies, translated in one place
+
+The raw tree is GLEAM's (`raw/daily/E/`); the store is the data engineering
+style guide's (`spatial/gleam.v_4_3_a.day.native_0p1x0p1.evaporation.zarr`).
+The mapping lives in [nomenclature-key_gleam.md](nomenclature-key_gleam.md) and
+is **parsed**, by `utils/nomenclature.py`, rather than restated in Python — one
+source of truth is the whole point of the guide requiring the file, and a dict
+beside the table would drift from it.
+
+The rule that keeps this manageable: **everything in the code carries GLEAM's
+name; only a rendered string carries the canonical one.** `settings['variable']`
+is `E` everywhere, `resolve_variables` expands to GLEAM names, `IDENTITIES` is
+written in them, and `variable_files` finds files by them. `template_fields` is
+the one place that translates, offering `{variable}`/`{original_variable}` and
+`{temporal_frequency}`/`{temporal_resolution}` as pairs. An attribute describing
+the *source files* must use `{original_variable}` — they really do hold an `E`.
+
+Consequences worth knowing before editing:
+
+- `--variable` accepts either spelling and normalises through `resolve_variable`.
+- The verifier holds both vocabularies at once, because it compares one against
+  the other. Every store access goes through `store_array(dataset, name)`, which
+  takes either; array *paths* (`chunk_coordinates`, `store.getsize`) need the
+  canonical name explicitly. Do not reintroduce a bare `dataset[name]` where
+  `name` came from `variables`.
+- `apply_nomenclature` renames the variable and writes the canonical attributes
+  on the lazy dataset, before anything is written — so a store is built correct
+  rather than corrected afterwards. It is a relabelling of a dask graph; no data
+  moves.
+- `canonical_variable_attrs` is shared by the build and
+  `migrate_nomenclature.py` deliberately. If each wrote its own version, a
+  migrated store and a fresh one would eventually describe the same data
+  differently, which is the one outcome this is all meant to prevent. It is
+  idempotent: applied twice it reads the `original_*` attributes back rather
+  than re-deriving them from values already replaced.
+- The region path takes its block variable from `sorted(dataset.data_vars)`, not
+  from the build's argument, because the block name goes into the commit message
+  that resume parses back.
+- Coordinates are **not** renamed: `nomenclature_data.md` has no rows for them.
 
 ### Two write strategies
 
@@ -279,11 +326,16 @@ way, so worst-case memory is `file_cache_maxsize` x `chunk_cache_size_mib`.
   read from the netCDF headers, so the family is pinned collectively without any
   build knowing about the others. It raises before anything is written.
 - A store's `title` and `summary` are **derived, not configured**
-  (`describe_variable`): a config cannot reach the netCDF `long_name`, so a
-  templated title could only say `Ep_aero` where this says 'potential
-  evaporation from the aerodynamic component'. Only the build calls it —
-  finalization deliberately does not, or a wording change would rewrite the
-  title of every published store.
+  (`describe_variable`): a config cannot reach the variable's `long_name`, so a
+  templated title could only say `potential_evaporation_aerodynamic` where this
+  says 'potential evaporation flux from the aerodynamic component'. The
+  frequency is written out in full there too — `frequency_long_name` gives
+  'daily average', because the canonical token `day` exists to be terse in a
+  filename and reads as a truncation in a sentence. The long name is lowercase
+  in the key, so the summary capitalises it and the title does not; each gets
+  the case its position needs. Only the build and `migrate_nomenclature.py`
+  call it — finalization deliberately does not, or a wording change would
+  rewrite the title of every published store.
 - `variable_attrs` in a config carries attributes true of one variable rather
   than of the layout, merged over the shared `attrs`. Only `E` has any: its
   upstream data gap. A store must not carry a note about data it does not hold.
@@ -311,8 +363,9 @@ does. Module docstrings carry the context needed to read the file.
 ### Layout
 
 The three entry points — `gleam_zarr.py`, `verify_gleam_zarr.py` and
-`finalize_gleam_zarr.py` — sit at the repo root. `validation/` holds the
-developer tests, `stage_fixture.py` and `test_pipeline.py`.
+`finalize_gleam_zarr.py` — sit at the repo root, as does the temporary
+`migrate_nomenclature.py` and the nomenclature key it reads. `validation/`
+holds the developer tests, `stage_fixture.py` and `test_pipeline.py`.
 
 **Settled 2026-09-14.** The trigger set on 2026-09-10 was "a second validation
 script", and `test_pipeline.py` is it. `pyproject.toml` now carries a

@@ -63,16 +63,18 @@ import zarr
 
 from utils.log_utils import setup_logging
 from utils.nomenclature import (
-    canonical_frequency,
     canonical_variable,
+    canonical_variable_attrs,
     key_path,
-    variables,
 )
 from utils.path_utils import (
+    ZARR_DIRNAME,
     format_filename,
     load_config,
     resolve_variables,
     store_path,
+    template_fields,
+    version_root,
 )
 from utils.zarr_utils import BRANCH, describe_variable, open_existing_repository
 
@@ -80,6 +82,14 @@ LOG = logging.getLogger(__name__)
 
 # the three steps, in the order they must run
 STEPS = ('rename-array', 'attrs', 'rename-store')
+
+# how a store was named before the style guide: GLEAM's frequency spelling and
+# GLEAM's variable name. The configs render the canonical form now, so this is
+# the last thing in the repo that can still name the old one
+LEGACY_FILENAME = (
+    '{suffix}/gleam.{version}.{temporal_resolution}.{grid_name}.'
+    '{original_variable}.zarr'
+)
 
 # The migration writes only the attributes nothing else regenerates. Most of a
 # store's global attributes come from the config and are written by
@@ -138,27 +148,26 @@ def revision():
         return 'unknown'
 
 
-def migrated_settings(settings, original):
-    """The settings that render a migrated store's name.
+def legacy_filename(settings, original, suffix=None):
+    """Render a store's name as it was spelled before the style guide.
 
-    The canonical variable name and the canonical frequency token are both
-    substituted, so ``store_path`` and ``format_filename`` produce the migrated
-    spelling from the config as it stands today. ``temporal_resolution`` is only
-    overridden for *naming*: the raw netCDF tree keeps GLEAM's own ``daily``
-    directory and nothing here reads it.
+    The configs have moved on, so this is the only place left that knows the old
+    convention -- which is right, because this script is the only thing that
+    still has to find a store under it.
 
     Args:
         settings (dict): The loaded configuration.
         original (str): The variable as GLEAM publishes it, e.g. 'E'.
+        suffix (str, optional): Override the layout directory, to render the
+            sibling layout's name instead of this one's.
 
     Returns:
-        dict: A copy of the settings with the canonical name and frequency.
+        str: e.g. 'spatial/gleam.v_4_3_a.daily.native_0p1x0p1.E.zarr'.
     """
-    return {
-        **settings,
-        'variable': canonical_variable(original),
-        'temporal_resolution': canonical_frequency(settings['temporal_resolution']),
-    }
+    fields = template_fields({**settings, 'variable': original})
+    if suffix is not None:
+        fields['suffix'] = suffix
+    return LEGACY_FILENAME.format_map(fields)
 
 
 def sibling_name(settings, original, migrated):
@@ -175,14 +184,15 @@ def sibling_name(settings, original, migrated):
     Returns:
         str: e.g. 'temporal/gleam.v_4_3_a.day.native_0p1x0p1.evaporation.zarr'.
     """
-    base = migrated_settings(settings, original) if migrated else {
-        **settings, 'variable': original
-    }
     suffix = settings['output_conventions']['suffix']
     other = 'temporal' if suffix == 'spatial' else 'spatial'
-    return format_filename(
-        {**base, 'output_conventions': {**base['output_conventions'], 'suffix': other}}
-    )
+    if not migrated:
+        return legacy_filename(settings, original, suffix=other)
+    return format_filename({
+        **settings,
+        'variable': original,
+        'output_conventions': {**settings['output_conventions'], 'suffix': other},
+    })
 
 
 def locate(settings, original):
@@ -198,8 +208,10 @@ def locate(settings, original):
     Raises:
         FileNotFoundError: If there is no store at either path.
     """
-    old = store_path({**settings, 'variable': original})
-    new = store_path(migrated_settings(settings, original))
+    old = os.path.join(
+        version_root(settings), ZARR_DIRNAME, legacy_filename(settings, original)
+    )
+    new = store_path({**settings, 'variable': original})
     for path in (new, old):
         if os.path.isdir(path):
             return path, new
@@ -296,52 +308,6 @@ def compare_fingerprints(before, after, label):
     return True
 
 
-def intended_variable_attrs(current, original):
-    """The attributes the migrated data variable should carry.
-
-    The ``original_*`` values are taken from what the store actually holds
-    rather than from the nomenclature key, so they record what GLEAM really
-    published instead of what a table claims it did. Once written they are the
-    source of truth, so re-running reads them back rather than re-deriving them
-    from attributes that have already been replaced.
-
-    Args:
-        current (dict): The variable's attributes as they stand.
-        original (str): The variable as GLEAM publishes it, e.g. 'E'.
-
-    Returns:
-        dict: The full attribute set for the migrated variable.
-    """
-    entry = variables()[original]
-    # on a re-run the canonical values are already in place, so the upstream
-    # strings have to come from the original_* attributes written last time
-    migrated = 'original_variable_name' in current
-    originals = {
-        'original_variable_name': current.get('original_variable_name', original),
-        'original_standard_name': current.get(
-            'original_standard_name' if migrated else 'standard_name', ''
-        ),
-        'original_long_name': current.get(
-            'original_long_name' if migrated else 'long_name', ''
-        ),
-        'original_units': current.get(
-            'original_units' if migrated else 'units', ''
-        ),
-    }
-    return {
-        **current,
-        'standard_name': entry.canonical,
-        'long_name': entry.long_name,
-        'units': entry.units,
-        **originals,
-        'unit_conversion': (
-            f'{entry.unit_conversion} -- {originals["original_units"]!r} and '
-            f'{entry.units!r} are the same unit under a different spelling; '
-            f'no value was changed'
-        ),
-    }
-
-
 def intended_root_attrs(dataset, settings, original, sha):
     """The global attributes the migration itself owns.
 
@@ -381,7 +347,7 @@ def intended_root_attrs(dataset, settings, original, sha):
     attrs = dict(dataset.attrs)
 
     # the same generator the build uses, over the canonical variable attributes
-    attrs.update(describe_variable(dataset, migrated_settings(settings, original)))
+    attrs.update(describe_variable(dataset, settings))
 
     old_sibling = sibling_name(settings, original, migrated=False)
     new_sibling = sibling_name(settings, original, migrated=True)
@@ -389,8 +355,8 @@ def intended_root_attrs(dataset, settings, original, sha):
         if key in attrs:
             attrs[key] = attrs[key].replace(old_sibling, new_sibling)
 
-    old_name = os.path.basename(store_path({**settings, 'variable': original}))
-    new_name = os.path.basename(store_path(migrated_settings(settings, original)))
+    old_name = os.path.basename(legacy_filename(settings, original))
+    new_name = os.path.basename(store_path({**settings, 'variable': original}))
     entry = (
         f'{datetime.date.today().isoformat()}: renamed the data variable '
         f'{original} -> {canonical} and restandardized its units, long_name and '
@@ -439,7 +405,7 @@ def plan_store(repository, settings, original, path, target):
 
     current_variable_attrs = dict(dataset[name].attrs)
     current_root_attrs = dict(dataset.attrs)
-    variable_attrs = intended_variable_attrs(current_variable_attrs, original)
+    variable_attrs = canonical_variable_attrs(current_variable_attrs, original)
 
     # describe_variable reads units and long_name off the variable, so the root
     # attributes have to be built from something already carrying the canonical

@@ -10,7 +10,7 @@ directories:
   logs: ./logs
 output_conventions:
   # one store per variable, as production; the layout is the directory
-  filename: '{suffix}/gleam.{version}.{temporal_resolution}.{grid_name}.{variable}.zarr'
+  filename: '{suffix}/gleam.{version}.{temporal_frequency}.{grid_name}.{variable}.zarr'
   # not 'spatial': the fixture tree already isolates these by directory, but a
   # distinct name means a mistyped path cannot quietly resolve to a real store
   suffix: fixture_temporal
@@ -38,6 +38,11 @@ chunk_cache_size_mib: 64
 
 attrs:
   Conventions: ACDD-1.3
+  temporal_frequency: '{temporal_frequency}'
+  original_temporal_frequency: '{temporal_resolution}'
+  source: >-
+    TEST FIXTURE, subset from the GLEAM {version_label} {temporal_resolution}
+    netCDF files holding {original_variable}
   comment: >-
     TEST FIXTURE -- a 100 x 200 window of GLEAM {version_label} over two years,
     built by validation/test_pipeline.py. Not data.
